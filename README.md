@@ -1,3 +1,3 @@
 # OPD-TTT
 
-On-Policy Distillation via Test Time Training
+On-Policy Distillation via Test-Time-Training
