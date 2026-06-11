@@ -1,0 +1,198 @@
+# OPD-TTT 1.5B 模型配置
+# On-Policy Distillation Enhanced Test-Time Training
+# 将 In-Place TTT 与教师模型指导相结合
+
+# ========== 模型配置 ==========
+model:
+  # 模型路径（包含分词器和初始化权重）
+  model_path: model_assets/llama_1b5_config
+  tokenizer_path: model_assets/llama_1b5_config
+
+  # OPD-TTT 基础设置
+  foundation:
+    # 启用 OPD-TTT 模式
+    opdttt_mode: true
+
+    # 应用 OPD-TTT 的层索引（每隔6层应用一次）
+    opdttt_layers: [0, 6, 12, 18]
+
+    # NTP 投影：将输入嵌入投影到 MLP 输出空间
+    ttt_proj: true
+
+    # 快速权重学习率
+    ttt_lr: 0.3
+
+    # 分块大小：用于并行处理
+    ttt_chunk: 4096
+
+    # NTP 目标类型：使用输入嵌入
+    ttt_target: input_embed
+
+    # ========== 四层损失函数权重 ==========
+    # 表示空间损失（更新快速权重）
+    lambda_ntp: 1.0           # NTP 对齐权重（自监督）
+    lambda_align_rep: 0.5     # 教师表示对齐权重（教师指导）
+
+    # 概率空间损失（更新慢速权重）
+    lambda_kl: 0.1            # KL 散度权重（教师指导）
+    lambda_lm: 1.0            # 语言建模损失权重（标准监督）
+
+# ========== 数据配置 ==========
+data:
+  # 数据基目录
+  data_dir: data
+
+  # 训练数据路径
+  train_path: pretrain_1b5_packed.jsonl
+
+  # 总训练 Token 数量（60B）
+  train_size: 60000000000
+
+  # 数据加载器类型
+  dataloader_type: native
+
+  # 数据集类型（可迭代）
+  datasets_type: iterable
+
+  # 数据类型（纯文本）
+  data_type: plaintext
+
+  # 最大序列长度
+  max_seq_len: 32768
+
+  # 文本字段键名
+  text_keys: content_split
+
+  # 是否丢弃最后不完整的批次
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  # 输出目录
+  output_dir: data/output/1b5_opdttt
+
+  # 数据并行模式（FSDP2 全参数分片）
+  data_parallel_mode: fsdp2
+
+  # Ulysses 并行大小
+  ulysses_parallel_size: 1
+
+  # 全局批次大小（128 × 32768 ≈ 4.19M tokens/步）
+  global_batch_size: 128
+
+  # 小批次大小
+  micro_batch_size: 1
+
+  # 是否使用移除填充（RMPad）
+  rmpad: false
+
+  # WandB 日志
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: 1b5-opdttt
+
+  # 最大训练步数（60B / 4.19M ≈ 14325 步）
+  max_steps: 14325
+
+  # RMPad 位置 ID 选项
+  rmpad_with_pos_ids: false
+
+  # 动态批次大小边距
+  dyn_bsz_margin: 0
+
+  # 优化器类型
+  optimizer: adamw
+
+  # 学习率
+  lr: 3.0e-4
+
+  # 学习率预热比例
+  lr_warmup_ratio: 0.10
+
+  # 学习率衰减风格
+  lr_decay_style: cosine
+
+  # 学习率衰减比例
+  lr_decay_ratio: 0.90
+
+  # 最小学习率
+  lr_min: 3.0e-6
+
+  # 权重衰减
+  weight_decay: 0.1
+
+  # 最大梯度范数
+  max_grad_norm: 1.0
+
+  # 启用混合精度训练（bfloat16）
+  enable_mixed_precision: true
+
+  # 梯度检查点（与 FSDP2+DTensor 存在兼容性问题，暂时禁用）
+  enable_gradient_checkpointing: false
+
+  # 启用全参数分片
+  enable_full_shard: true
+
+  # 启用 FSDP 卸载
+  enable_fsdp_offload: false
+
+  # 启用激活卸载
+  enable_activation_offload: false
+
+  # 初始化设备（meta 设备节省内存）
+  init_device: meta
+
+  # 检查点管理器（DCP 分布式检查点）
+  ckpt_manager: dcp
+
+  # 检查点保存路径
+  save_checkpoint_path: data/output/1b5_opdttt/checkpoints
+
+  # 保存间隔（每 500 步）
+  save_steps: 500
+
+  # 保存 HuggingFace 格式权重
+  save_hf_weights: true
+
+  # 空缓存间隔
+  empty_cache_steps: 10
+
+  # 随机种子
+  seed: 42
+
+# ========== OPD-TTT 特定参数 ==========
+opdttt:
+  # 教师模型路径（留空则不使用教师，等同于纯 TTT）
+  teacher_model_path: ""
+
+  # 启用教师输出缓存
+  enable_teacher_cache: true
+
+  # 损失权重（可覆盖 foundation 中的设置）
+  lambda_kl: 0.1
+  lambda_lm: 1.0
+  lambda_ntp: 1.0
+  lambda_align_rep: 0.5
+
+  # TTT/OPD-TTT 参数
+  ttt_lr: 0.3
+  ttt_chunk: 4096
+  ttt_proj: true
+
+  # 应用 OPD-TTT 的层
+  opdttt_layers: [0, 6, 12, 18]
+
+  # ========== 新增：PCA 初始化和自适应权重 ==========
+  # 教师投影矩阵初始化方式
+  # - "random": 随机初始化（默认）
+  # - "pca": 使用 PCA 初始化（需要提供 teacher_embeddings_path）
+  teacher_proj_init: "random"
+
+  # 用于 PCA 初始化的教师嵌入文件路径
+  # 提取方法: python scripts/extract_teacher_embeddings.py --help
+  teacher_embeddings_path: ""
+
+  # 权重调整方式
+  # - "fixed": 使用固定权重（默认）
+  # - "adaptive": 根据 NTP 和教师梯度的余弦相似度动态调整权重
+  weight_adaptation: "fixed"

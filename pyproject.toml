@@ -1,0 +1,38 @@
+[project]
+name = "ttt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch==2.5.1",
+    "torchvision==0.20.1", # 对应 torch 2.5.1 的稳定版本
+    "torchaudio==2.5.1",   # 对应 torch 2.5.1 的稳定版本
+    "flash-attn==2.7.0.post2", # 升级到支持 CUDA 12 + Torch 2.5 + Python 3.11 的版本
+    "VeOmni",
+    "transformers==4.57.3",
+    "einops",
+    "opt-einsum",
+    "liger-kernel",
+    "datasets",
+    "psutil",
+    "wandb",
+    "torchdata",
+    "blobfile",
+    "diffusers",
+    "tiktoken",
+    "timm",
+    "modelscope",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+extra-index-url = ["https://download.pytorch.org/whl/cu121"]
+
+[tool.uv.sources]
+torch = { url = "https://mirror.nju.edu.cn/pytorch/whl/cu121/torch-2.5.1+cu121-cp311-cp311-linux_x86_64.whl" }
+
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
+
+# 本地可编辑安装 VeOmni
+VeOmni = { path = "./VeOmni", editable = true }

@@ -1,0 +1,54 @@
+model:
+  model_path: model_assets/lact_500m_config
+  model_type: lact_swiglu
+  attn_implementation: flash_attention_2  # Use Flash Attention 2.0 for better memory efficiency
+  foundation:
+    ttt_mode: false  # LaCT has its own TTT implementation
+
+data:
+  data_dir: data
+  train_path: pretrain_500m_packed.jsonl
+  train_size: 20000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 32768
+  text_keys: content_split
+  drop_last: true
+
+train:
+  output_dir: data/output/500m_lact
+  # Compatibility: Using FSDP2 with PyTorch 2.4.x has known issues.
+  # Recommend upgrading to PyTorch 2.5.1 to fix expandable_segment bug.
+  # See VeOmni/PYTORCH_24_COMPATIBILITY.md for details.
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 66
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: inplace-ttt-figure2
+  wandb_name: 500m-lact
+  max_steps: 9575
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  optimizer: adamw
+  lr: 5.0e-4
+  lr_warmup_ratio: 0.10
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  lr_min: 5.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: false
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  activation_gpu_limit: 0.0
+  init_device: meta
+  ckpt_manager: dcp
+  save_steps: 500
+  save_hf_weights: true
+  empty_cache_steps: 10
+  seed: 42
