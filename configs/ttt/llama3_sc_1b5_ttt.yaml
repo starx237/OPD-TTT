@@ -1,5 +1,7 @@
 model:
   model_path: model_assets/llama_1b5_config
+  tokenizer_path: model_assets/tokenizer
+  vocab_size: 151646
   foundation:
     ttt_layers: [0, 6, 12, 18]
     ttt_mode: true
@@ -10,7 +12,7 @@ model:
 
 data:
   data_dir: data
-  train_path: pretrain_1b5_packed.jsonl
+  train_path: piles_packed_32768.jsonl
   train_size: 60000000000
   dataloader_type: native
   datasets_type: iterable

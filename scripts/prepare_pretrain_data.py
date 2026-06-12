@@ -1,59 +1,104 @@
 #!/usr/bin/env python3
 """
-从 ModelScope 的 Shanghai_AI_Laboratory/WanJuanCC 下载英文数据并转为 JSONL。
+训练数据准备脚本
+
+支持以下数据源:
+1. WanJuanCC (万卷): ModelScope 上的中文数据集
+2. PILES: HuggingFace 上的英文数据集（推荐，更适合长文本训练）
 
 数据格式:
-  远程: tar.gz 文件 (每个 ~3.4GB), 内嵌 jsonl/part-*.jsonl
-  字段: id, content(文本), title, language(语言), date, token_num, ...
+  - WanJuanCC: tar.gz 文件，内嵌 jsonl
+  - PILES: 直接从 HuggingFace datasets 加载
 
 特点:
-  - 使用 ModelScope SDK 获取文件列表和下载 URL
-  - 带断点续传: 每处理完一个 tar.gz 即记录到状态文件
-  - 边下载边处理边删除: 不保留 tar.gz 压缩包
-  - 中断后重跑自动继续
+  - 带断点续传
+  - 边下载边处理
+  - 支持长文本（32768 tokens）
 
 用法:
+    # 使用 PILES 数据集（推荐）
+    python scripts/prepare_pretrain_data.py \
+        --dataset piles \
+        --output data/pretrain_piles.jsonl \
+        --target_tokens 20000000000
+
+    # 使用 WanJuanCC 数据集
+    python scripts/prepare_pretrain_data.py \
+        --dataset wanjuan \
+        --output data/pretrain_wanjuan.jsonl \
+        --target_tokens 20000000000
+
     # Dry run 测试
     python scripts/prepare_pretrain_data.py \
-        --output data/pretrain_500m.jsonl \
-        --target_tokens 20000000000 \
+        --dataset piles \
+        --output data/test.jsonl \
+        --target_tokens 1000000 \
         --dry_run
-
-    # 实际下载 500M 数据 (20B tokens)
-    python scripts/prepare_pretrain_data.py \
-        --output data/pretrain_500m.jsonl \
-        --target_tokens 20000000000
-
-    # 中断后续传 (自动检测状态文件)
-    python scripts/prepare_pretrain_data.py \
-        --output data/pretrain_500m.jsonl \
-        --target_tokens 20000000000
-
-    # 强制从头开始 (忽略状态文件)
-    python scripts/prepare_pretrain_data.py \
-        --output data/pretrain_500m.jsonl \
-        --target_tokens 20000000000 \
-        --force
 """
 
 import argparse
 import gzip
 import json
 import os
-import shutil
 import tarfile
-import tempfile
 import time
 import requests
+import sys
 
-from modelscope.hub.api import HubApi
+# 设置 PILES 默认镜像（必须在导入 datasets 之前）
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
-DATASET_NAMESPACE = "Shanghai_AI_Laboratory"
-DATASET_NAME = "WanJuanCC"
-TEXT_KEY = "content"            # jsonl 中的文本字段
-CONTENT_KEY = "content_split"    # 输出 JSONL 中的 key
-LANGUAGE_KEY = "language"        # 语言过滤字段
-TAR_TEMP_DIR = "data/wanjuanc_tar"  # 下载临时目录 (可通过 --data-dir 改变基路径)
+# WanJuanCC 相关
+try:
+    from modelscope.hub.api import HubApi
+    MODELSCOPE_AVAILABLE = True
+except ImportError:
+    MODELSCOPE_AVAILABLE = False
+
+# PILES 相关
+try:
+    from datasets import load_dataset
+    DATASETS_AVAILABLE = True
+except ImportError:
+    DATASETS_AVAILABLE = False
+
+# WanJuanCC 配置
+WANJUAN_NAMESPACE = "Shanghai_AI_Laboratory"
+WANJUAN_NAME = "WanJuanCC"
+TEXT_KEY = "content"
+CONTENT_KEY = "content_split"
+LANGUAGE_KEY = "language"
+TAR_TEMP_DIR = "data/wanjuanc_tar"
+
+# PILES 配置
+# 数据集: ArmelR/the-pile-splitted (https://hf-mirror.com/datasets/ArmelR/the-pile-splitted)
+PILE_SUBSETS = [
+    "ArXiv",      # 学术论文，长文本
+    "Books3",     # 图书，长文本
+    "Wikipedia (en)",     # 维基百科
+    "PubMed Central",     # 医学文献
+    "Pile-CC",      # 网页
+    "Github",       # 代码
+]
+DEFAULT_PILE_SUBSETS = ["ArXiv", "Books3", "Wikipedia (en)", "PubMed Central", "Pile-CC", "Github"]
+
+# 子集权重配置（总和为 1.0）
+# Books3 和 ArXiv 权重更高
+PILE_SUBSET_WEIGHTS = {
+    "ArXiv": 0.25,           # 25% - 学术论文，高质量
+    "Books3": 0.25,          # 25% - 图书，长文本
+    "Wikipedia (en)": 0.15,  # 15% - 维基百科
+    "PubMed Central": 0.15,  # 15% - 医学文献
+    "Pile-CC": 0.10,         # 10% - 网页
+    "Github": 0.10,          # 10% - 代码
+}
+# 总权重验证
+assert abs(sum(PILE_SUBSET_WEIGHTS.values()) - 1.0) < 0.01, "子集权重总和必须为 1.0"
+
+# 长文本配置（最小 30k 字符 ≈ 7.5k tokens）
+MIN_LONG_TEXT_CHARS = 30000  # 最小 30k 字符（约 7.5k tokens）
+MAX_LONG_TEXT_CHARS = 131072  # 最大约 32k tokens
+PACKED_TARGET_TOKENS = 32768  # 打包目标长度
 
 
 def estimate_tokens(text: str) -> int:
@@ -68,12 +113,7 @@ def format_time(seconds: float) -> str:
 
 
 class StateFile:
-    """
-    管理断点续传的状态文件。
-    路径: {output}.state.json
-    格式: {"processed": [...], "total_tokens": N, "total_lines": N}
-    """
-
+    """管理断点续传的状态文件"""
     def __init__(self, output_path: str):
         self.path = output_path + ".state.json"
 
@@ -92,30 +132,200 @@ class StateFile:
             json.dump(state, f, ensure_ascii=False)
         os.replace(tmp, self.path)
 
-    def mark_done(self, file_path: str, total_tokens: int, total_lines: int) -> None:
+    def mark_done(self, item: str, total_tokens: int, total_lines: int) -> None:
         state = self.load()
-        if file_path not in state["processed"]:
-            state["processed"].append(file_path)
+        if item not in state["processed"]:
+            state["processed"].append(item)
         state["total_tokens"] = total_tokens
         state["total_lines"] = total_lines
         self.save(state)
 
-    def is_done(self, file_path: str) -> bool:
-        return file_path in self.load()["processed"]
+    def is_done(self, item: str) -> bool:
+        return item in self.load()["processed"]
 
     def delete(self) -> None:
         if os.path.isfile(self.path):
             os.remove(self.path)
 
 
-def get_file_list() -> list:
+# ========== PILES 数据集处理 ==========
+
+def process_piles_dataset(
+    output_path: str,
+    target_tokens: int,
+    subsets: list = None,
+    max_length: int = MAX_LONG_TEXT_CHARS,
+    min_length: int = MIN_LONG_TEXT_CHARS,
+    dry_run: bool = False,
+    mirror: str = "https://hf-mirror.com",
+) -> tuple[int, int]:
     """
-    通过 ModelScope SDK 获取数据集文件列表。
-    返回: [{"name": ..., "path": ..., "size": ..., "download_url": ...}, ...]
+    处理 PILES 数据集
+
+    Args:
+        output_path: 输出文件路径
+        target_tokens: 目标 token 数
+        subsets: 数据子集列表
+        max_length: 单条文本最大字符数
+        min_length: 单条文本最小字符数
+        dry_run: 是否为 dry run 模式
+        mirror: HuggingFace 镜像站
+
+    Returns:
+        (处理的行数, 总 token 数)
     """
+    if not DATASETS_AVAILABLE:
+        print("错误: 需要安装 datasets 库")
+        print("请运行: pip install datasets")
+        return 0, 0
+
+    if subsets is None:
+        subsets = DEFAULT_PILE_SUBSETS
+
+    # 设置镜像
+    os.environ["HF_ENDPOINT"] = mirror
+
+    print(f"{'=' * 60}")
+    print(f"PILES 数据集处理")
+    print(f"{'=' * 60}")
+    print(f"子集: {', '.join(subsets)}")
+    print(f"目标: {target_tokens / 1e9:.0f}B tokens")
+    print(f"输出: {output_path}")
+    print(f"镜像: {mirror}")
+    if dry_run:
+        print("🔷 DRY RUN: 仅处理少量数据")
+    print()
+
+    state = StateFile(output_path)
+    loaded_state = state.load()
+    total_tokens = loaded_state["total_tokens"]
+    total_lines = loaded_state["total_lines"]
+    processed_subsets = set(loaded_state["processed"])
+
+    # 过滤未处理的子集
+    remaining = [s for s in subsets if s not in processed_subsets]
+    skipped = len(subsets) - len(remaining)
+
+    if skipped > 0:
+        print(f"📋 状态文件发现 {skipped} 个已处理子集")
+        if not remaining:
+            print("  ✅ 所有子集已处理完毕!")
+            return total_lines, total_tokens
+        print(f"  还需处理 {len(remaining)}/{len(subsets)} 个")
+
+    if not dry_run and total_tokens >= target_tokens:
+        print(f"✅ 目标 tokens ({target_tokens/1e9:.0f}B) 已达成，跳过")
+        return total_lines, total_tokens
+
+    overall_start = time.time()
+
+    # 计算每个子集的配额
+    subset_quotas = {}
+    remaining_total = target_tokens - total_tokens
+    if remaining_total <= 0:
+        print(f"✅ 目标 tokens ({target_tokens/1e9:.0f}B) 已达成，跳过")
+        return total_lines, total_tokens
+
+    print(f"\n📊 子集配额分配 (目标: {remaining_total/1e9:.2f}B tokens):")
+    for subset in subsets:
+        if subset in PILE_SUBSET_WEIGHTS:
+            quota = int(remaining_total * PILE_SUBSET_WEIGHTS[subset])
+        else:
+            # 默认权重（均分剩余部分）
+            quota = int(remaining_total / len(subsets))
+        subset_quotas[subset] = quota
+        weight_pct = PILE_SUBSET_WEIGHTS.get(subset, 0) * 100
+        print(f"  {subset:20s}: {quota/1e9:.2f}B ({weight_pct:.0f}%)")
+
+    for subset in remaining:
+        print(f"\n{'=' * 60}")
+        print(f"处理子集: {subset}")
+        print(f"配额: {subset_quotas.get(subset, 0)/1e9:.2f}B tokens")
+        print(f"当前: {total_lines:,} 条, ~{total_tokens/1e9:.2f}B tokens")
+        print(f"{'=' * 60}")
+
+        subset_start = time.time()
+        count = 0
+        subset_tokens = 0
+        subset_quota = subset_quotas.get(subset, remaining_total)
+
+        try:
+            # 加载数据集
+            print(f"  加载数据集...")
+            dataset = load_dataset(
+                "ArmelR/the-pile-splitted",
+                data_files=f"data/{subset}/train/*.arrow",
+                split="train",
+                streaming=True,
+            )
+
+            with open(output_path, "a", encoding="utf-8") as out_f:
+                for item in dataset:
+                    if not dry_run and subset_tokens >= subset_quota:
+                        print(f"  子集配额已达 ({subset_tokens/1e9:.2f}B)，切换下一个")
+                        break
+
+                    text = item.get("text", "")
+                    if not text or len(text) < min_length:
+                        continue
+
+                    text = text[:max_length]
+                    record = {CONTENT_KEY: text}
+                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+                    total_lines += 1
+                    text_tokens = estimate_tokens(text)
+                    total_tokens += text_tokens
+                    subset_tokens += text_tokens
+                    count += 1
+
+                    if total_lines % 10000 == 0:
+                        elapsed = time.time() - subset_start
+                        rate = total_lines / max(elapsed, 1)
+                        pct = min(100, subset_tokens / subset_quota * 100) if subset_quota > 0 else 100
+                        print(f"  已处理 {total_lines:,} 行, ~{total_tokens/1e9:.2f}B tokens, "
+                              f"子集进度: {pct:.1f}%, {rate:.0f} 行/s", flush=True)
+
+                    if dry_run and total_lines >= 100:
+                        break
+
+        except Exception as e:
+            print(f"  警告: 处理子集 {subset} 失败: {e}")
+            continue
+
+        # 更新状态
+        if not dry_run:
+            state.mark_done(subset, total_tokens, total_lines)
+
+        elapsed = time.time() - subset_start
+        print(f"  子集完成: {count} 行, {subset_tokens/1e9:.2f}B tokens, {format_time(elapsed)}")
+
+        if not dry_run and total_tokens >= target_tokens:
+            print(f"\n  ✅ 目标 {target_tokens/1e9:.0f}B tokens 已达成, 停止")
+            break
+
+    overall_elapsed = time.time() - overall_start
+    print(f"\n{'=' * 60}")
+    print(f"PILES 处理完成")
+    print(f"  耗时: {format_time(overall_elapsed)}")
+    print(f"  条数: {total_lines:,}")
+    print(f"  tokens: ~{total_tokens/1e9:.2f}B")
+
+    return total_lines, total_tokens
+
+
+# ========== WanJuanCC 数据集处理 ==========
+
+def get_wanjuan_file_list() -> list:
+    """获取 WanJuanCC 文件列表"""
+    if not MODELSCOPE_AVAILABLE:
+        print("错误: 需要安装 modelscope 库")
+        print("请运行: pip install modelscope")
+        return []
+
     api = HubApi()
     files = api.get_dataset_files(
-        f"{DATASET_NAMESPACE}/{DATASET_NAME}",
+        f"{WANJUAN_NAMESPACE}/{WANJUAN_NAME}",
         revision="master",
     )
     result = []
@@ -124,8 +334,8 @@ def get_file_list() -> list:
             continue
         download_url = api.get_dataset_file_url(
             file_name=f["Path"],
-            dataset_name=DATASET_NAME,
-            namespace=DATASET_NAMESPACE,
+            dataset_name=WANJUAN_NAME,
+            namespace=WANJUAN_NAMESPACE,
             revision="master",
         )
         result.append({
@@ -138,46 +348,34 @@ def get_file_list() -> list:
     return result
 
 
-def download_file(url: str, dest: str) -> None:
-    """
-    流式下载单个文件，支持断点续传和进度显示。
-    先下载到 .incomplete 后缀，完成后 rename，避免不完整文件。
-    """
-    import sys
+def download_wanjuan_file(url: str, dest: str) -> None:
+    """下载 WanJuanCC 文件"""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     headers = {"User-Agent": "modelscope"}
     tmp_dest = dest + ".incomplete"
 
-    # 检查是否已存在完整文件
     if os.path.isfile(dest):
-        print(f"  📦 已有本地缓存")
         return
 
-    # 检查不完整文件（断点续传）
     if os.path.isfile(tmp_dest):
         downloaded_size = os.path.getsize(tmp_dest)
         headers["Range"] = f"bytes={downloaded_size}-"
         mode = "ab"
-        print(f"  📄 续传 ({downloaded_size/1e9:.2f}GB 已下载)...")
     else:
         downloaded_size = 0
         mode = "wb"
 
-    max_retries = 3
-    for attempt in range(max_retries):
+    for attempt in range(3):
         try:
             resp = requests.get(url, headers=headers, stream=True, timeout=(30, 300))
             resp.raise_for_status()
 
             total_size = int(resp.headers.get("content-length", 0))
             if "Range" in headers:
-                # 断点续传时，content-length 是剩余大小
                 total_size += downloaded_size
 
             downloaded = downloaded_size
             start_time = time.time()
-            last_update = start_time
-            last_size = downloaded_size
 
             with open(tmp_dest, mode) as f:
                 for chunk in resp.iter_content(chunk_size=8 * 1024 * 1024):
@@ -185,53 +383,23 @@ def download_file(url: str, dest: str) -> None:
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        # 每秒更新一次进度
-                        now = time.time()
-                        if now - last_update >= 1.0:
-                            elapsed = now - start_time
-                            chunk_speed = (downloaded - last_size) / (now - last_update)
-                            progress = downloaded / total_size * 100 if total_size > 0 else 0
-                            mb_downloaded = downloaded / 1e6
-                            mb_total = total_size / 1e6
-                            sys.stdout.write(
-                                f"\r  ⬇️  {mb_downloaded:.1f}/{mb_total:.1f}MB ({progress:.1f}%) @ {chunk_speed/1e6:.1f}MB/s"
-                            )
-                            sys.stdout.flush()
-                            last_update = now
-                            last_size = downloaded
-
             os.replace(tmp_dest, dest)
-            # 下载完成，显示最终信息
-            elapsed = time.time() - start_time
-            avg_speed = (downloaded - downloaded_size) / max(elapsed, 1)
-            print(f"\r  ⬇️  完成 ({downloaded/1e9:.2f}GB, {elapsed:.0f}s, {avg_speed/1e6:.1f}MB/s)     ")
             return
 
         except Exception as e:
             if os.path.isfile(tmp_dest):
                 downloaded_size = os.path.getsize(tmp_dest)
-            print(f"\n  ⚠️  下载失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                wait_time = 5 * (attempt + 1)
-                print(f"  🔄 {wait_time}秒后重试...")
-                time.sleep(wait_time)
-                # 重置 headers 和 mode
-                headers = {"User-Agent": "modelscope"}
-                mode = "wb"
-                tmp_dest = dest + ".incomplete"
-                if os.path.isfile(tmp_dest):
-                    downloaded_size = os.path.getsize(tmp_dest)
-                    headers["Range"] = f"bytes={downloaded_size}-"
-                    mode = "ab"
-            else:
-                if os.path.isfile(tmp_dest):
-                    # 保留不完整文件，以便下次续传
-                    print(f"  📄 不完整文件已保存: {tmp_dest}")
-                raise
+            print(f"  下载失败 (尝试 {attempt + 1}/3): {e}")
+            if attempt < 2:
+                time.sleep(5 * (attempt + 1))
+
+    if os.path.isfile(tmp_dest):
+        os.remove(tmp_dest)
+    raise Exception("下载失败")
 
 
-def extract_jsonl_lines(tar_path: str) -> iter:
-    """从本地 tar.gz 文件中逐行 yield jsonl 文本。"""
+def extract_wanjuan_lines(tar_path: str) -> iter:
+    """从 WanJuanCC tar.gz 文件中提取行"""
     with gzip.open(tar_path, "rb") as zf:
         with tarfile.open(fileobj=zf, mode="r") as tar:
             for member in tar:
@@ -245,152 +413,95 @@ def extract_jsonl_lines(tar_path: str) -> iter:
                             yield line
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output", type=str, required=True,
-                        help="输出的 JSONL 文件路径")
-    parser.add_argument("--target_tokens", type=int, required=True,
-                        help="目标 token 数")
-    parser.add_argument("--max_length", type=int, default=131072,
-                        help="单条文本最大字符数 (默认 131072)")
-    parser.add_argument("--min_length", type=int, default=200,
-                        help="单条文本最小字符数 (默认 200)")
-    parser.add_argument("--language", type=str, default="en",
-                        help="语言过滤 (默认 en)")
-    parser.add_argument("--dry_run", action="store_true",
-                        help="Dry run: 仅处理 10 条")
-    parser.add_argument("--force", action="store_true",
-                        help="忽略已有状态文件，从头开始")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="数据存储基目录 (默认使用 output 所在目录下的 data/)")
-    args = parser.parse_args()
+def process_wanjuan_dataset(
+    output_path: str,
+    target_tokens: int,
+    max_length: int = 131072,
+    min_length: int = 200,
+    language: str = "en",
+    dry_run: bool = False,
+    data_dir: str = None,
+) -> tuple[int, int]:
+    """处理 WanJuanCC 数据集"""
+    if not MODELSCOPE_AVAILABLE:
+        print("错误: 需要安装 modelscope 库")
+        print("请运行: pip install modelscope")
+        return 0, 0
 
-    # 如果指定了 --data-dir，data 相关目录和文件都在其下
-    if args.data_dir:
-        data_dir = args.data_dir
-    else:
-        data_dir = os.path.dirname(os.path.abspath(args.output))
+    if data_dir is None:
+        data_dir = os.path.dirname(os.path.abspath(output_path))
     tar_dir = os.path.join(data_dir, "wanjuanc_tar")
 
-    os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     os.makedirs(tar_dir, exist_ok=True)
 
-    state = StateFile(args.output)
-    if args.force:
-        print("🔶 --force: 忽略已有状态，从头开始")
-        state.delete()
-
-    print(f"数据集:   {DATASET_NAMESPACE}/{DATASET_NAME}")
-    print(f"目标:     {args.target_tokens / 1e9:.0f}B tokens")
-    print(f"输出:     {args.output}")
-    if args.dry_run:
-        print("🔷 DRY RUN: 仅处理 10 条")
+    print(f"{'=' * 60}")
+    print(f"WanJuanCC 数据集处理")
+    print(f"{'=' * 60}")
+    print(f"目标: {target_tokens / 1e9:.0f}B tokens")
+    print(f"语言: {language}")
+    print(f"输出: {output_path}")
+    if dry_run:
+        print("🔷 DRY RUN: 仅处理少量数据")
     print()
 
-    # [1/3] 获取文件列表
-    print("[1/3] 获取 WanJuanCC 文件列表...")
-    file_list = get_file_list()
-    if not file_list:
-        print("  ❌ 未找到任何 tar.gz 文件!")
-        return
-    total_files = len(file_list)
-    total_gb = sum(f["size"] for f in file_list) / 1e9
-    print(f"  找到 {total_files} 个 tar.gz 文件 (共 {total_gb:.1f}GB 压缩)")
-    print(f"  首个: {file_list[0]['name']}")
-    print(f"  末尾: {file_list[-1]['name']}")
-
-    # 加载已处理状态
+    state = StateFile(output_path)
     loaded_state = state.load()
-    processed_set = set(loaded_state["processed"])
     total_tokens = loaded_state["total_tokens"]
     total_lines = loaded_state["total_lines"]
 
-    # 过滤未处理的文件
-    remaining = [f for f in file_list if f["path"] not in processed_set]
-    skipped = total_files - len(remaining)
+    # 获取文件列表
+    print("[1/2] 获取 WanJuanCC 文件列表...")
+    file_list = get_wanjuan_file_list()
+    if not file_list:
+        print("  ❌ 未找到任何 tar.gz 文件!")
+        return 0, 0
 
-    if skipped > 0:
-        print(f"\n📋 状态文件发现 {skipped} 个已处理完成")
-        if not remaining:
-            print("  ✅ 所有文件已处理完毕!")
-            return
-        print(f"  还需处理 {len(remaining)}/{total_files} 个")
+    total_files = len(file_list)
+    remaining = [f for f in file_list if f["path"] not in set(loaded_state["processed"])]
 
-    if not args.dry_run and total_tokens >= args.target_tokens:
-        print(f"✅ 目标 tokens ({args.target_tokens/1e9:.0f}B) 已达成，跳过")
-        return
+    if not dry_run and total_tokens >= target_tokens:
+        print(f"✅ 目标 tokens ({target_tokens/1e9:.0f}B) 已达成，跳过")
+        return total_lines, total_tokens
 
-    if args.dry_run:
-        print("\n🔷 DRY RUN 模式: 不记录状态文件，不保留压缩包")
+    write_mode = "a" if total_lines > 0 else "w"
+    print(f"[2/2] 下载并处理数据...")
 
-    if total_tokens > 0:
-        print(f"📋 从上次继续: {total_lines:,} 条, ~{total_tokens/1e9:.2f}B tokens")
-        write_mode = "a"
-    else:
-        print("📋 全新开始")
-        write_mode = "w"
-
-    # ========== 主循环 ==========
-    print("\n[2/3] 下载并处理数据...")
     start_time = time.time()
 
-    with open(args.output, write_mode, encoding="utf-8") as out_f:
+    with open(output_path, write_mode, encoding="utf-8") as out_f:
         for idx, f_info in enumerate(remaining):
-            if not args.dry_run and total_tokens >= args.target_tokens:
-                print(f"\n  ✅ 目标 {args.target_tokens/1e9:.0f}B tokens 已达成, 停止")
+            if not dry_run and total_tokens >= target_tokens:
                 break
 
-            elapsed = time.time() - start_time
-            print(f"\n  [{idx + 1 + skipped}/{total_files}] {f_info['name']}")
-            print(f"  当前: {total_lines:,} 条, ~{total_tokens/1e9:.2f}B tok, {format_time(elapsed)}")
+            print(f"\n  [{idx + 1}/{len(remaining)}] {f_info['name']}")
 
-            # Step A: 下载 tar.gz 到临时目录
+            # 下载
             tar_local = os.path.join(tar_dir, f_info["name"])
-            incomplete_local = tar_local + ".incomplete"
+            try:
+                download_wanjuan_file(f_info["download_url"], tar_local)
+            except Exception as e:
+                print(f"  跳过: {e}")
+                continue
 
-            # 检查不完整文件
-            if os.path.isfile(incomplete_local):
-                incomplete_size = os.path.getsize(incomplete_local) / 1e9
-                total_size = f_info["size"] / 1e9
-                print(f"  📄 发现未完成下载 ({incomplete_size:.2f}/{total_size:.2f}GB)，继续...")
-
-            if os.path.isfile(tar_local):
-                print(f"  📦 已有本地缓存 {tar_local}")
-            else:
-                print(f"  ⬇️  下载中 ({f_info['size']/1e9:.2f}GB)...")
-                t0 = time.time()
-                try:
-                    download_file(f_info["download_url"], tar_local)
-                    dl_time = time.time() - t0
-                    # 下载完成信息已在 download_file 中打印
-                except Exception as e:
-                    print(f"❌ 下载失败: {e}")
-                    print(f"  提示: 可以重新运行脚本，它会自动续传")
-                    if not args.dry_run:
-                        state.mark_done(f_info["path"], total_tokens, total_lines)
-                    continue
-
-            # Step B: 解压提取 jsonl (streaming from tar.gz)
-            print(f"  📖 解压提取...", end=" ", flush=True)
-            t0 = time.time()
+            # 提取
             count = 0
             try:
-                lines_iter = extract_jsonl_lines(tar_local)
-                for line in lines_iter:
+                for line in extract_wanjuan_lines(tar_local):
                     try:
                         data = json.loads(line)
                     except json.JSONDecodeError:
                         continue
 
                     lang = data.get(LANGUAGE_KEY, "")
-                    if lang and lang != args.language:
+                    if lang and lang != language:
                         continue
 
                     text = data.get(TEXT_KEY, "")
-                    if not text or len(text) < args.min_length:
+                    if not text or len(text) < min_length:
                         continue
 
-                    text = text[:args.max_length]
+                    text = text[:max_length]
                     record = {CONTENT_KEY: text}
                     out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -398,58 +509,123 @@ def main():
                     total_tokens += estimate_tokens(text)
                     count += 1
 
-                    if args.dry_run and total_lines >= 10:
+                    if dry_run and total_lines >= 10:
                         break
-                    if not args.dry_run and total_tokens >= args.target_tokens:
+                    if not dry_run and total_tokens >= target_tokens:
                         break
 
-                dt = time.time() - t0
-                print(f"{count} 条英文行 ({dt:.1f}s)")
             except Exception as e:
-                print(f"❌ 解压失败: {e}")
-                if not args.dry_run:
-                    state.mark_done(f_info["path"], total_tokens, total_lines)
-                # 清理损坏文件
-                if os.path.isfile(tar_local):
-                    os.remove(tar_local)
-                continue
+                print(f"  解压失败: {e}")
 
-            # Step C: 删除 tar.gz
+            # 删除压缩包
             if os.path.isfile(tar_local):
                 os.remove(tar_local)
-                print(f"  🗑️  已删除压缩包")
 
-            # Step D: 更新状态文件 (非 dry run 时)
-            if not args.dry_run:
+            # 更新状态
+            if not dry_run:
                 state.mark_done(f_info["path"], total_tokens, total_lines)
 
-            if args.dry_run and total_lines >= 10:
-                print("  🔷 DRY RUN: 10 条完成, 停止")
+            if dry_run and total_lines >= 10:
                 break
 
-    # ========== 汇总 ==========
     elapsed = time.time() - start_time
-    file_size = os.path.getsize(args.output) / 1e9
-    print(f"\n{'─' * 55}")
-    tag = "DRY RUN ✅" if args.dry_run else "完成 ✅"
-    print(f"  {tag}")
-    print(f"  耗时:     {format_time(elapsed)}")
-    print(f"  条数:     {total_lines:,}")
-    print(f"  tokens:   ~{total_tokens/1e9:.2f}B / {args.target_tokens/1e9:.0f}B")
-    print(f"  文件:     {file_size:.2f}GB")
-    print(f"  平均:     {total_tokens / max(total_lines, 1):.1f} tok/条")
-    print(f"  状态:     {state.path}")
+    print(f"\n{'=' * 60}")
+    print(f"WanJuanCC 处理完成")
+    print(f"  耗时: {format_time(elapsed)}")
+    print(f"  条数: {total_lines:,}")
+    print(f"  tokens: ~{total_tokens/1e9:.2f}B")
 
-    if not args.dry_run and total_tokens < args.target_tokens:
-        shortfall = (args.target_tokens - total_tokens) / 1e9
-        print(f"\n⚠️  数据不足! 还差 ~{shortfall:.1f}B tokens")
-        print(f"  已处理完 WanJuanCC 全部 {total_files} 个文件")
-        print(f"  可能需要补充其他数据集")
+    return total_lines, total_tokens
 
-    # 清理空临时目录
-    if os.path.isdir(tar_dir) and not os.listdir(tar_dir):
-        os.rmdir(tar_dir)
-        print(f"  已清理临时目录 {tar_dir}")
+
+# ========== 主函数 ==========
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="准备训练数据（支持 PILES 和 WanJuanCC 数据集）"
+    )
+    parser.add_argument(
+        "--dataset", type=str, choices=["piles", "wanjuan"], default="piles",
+        help="数据集类型（默认: piles，推荐用于长文本训练）"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True,
+        help="输出的 JSONL 文件路径"
+    )
+    parser.add_argument(
+        "--target_tokens", type=int, default=20000000000,
+        help="目标 token 数（默认: 20B）"
+    )
+    parser.add_argument(
+        "--max_length", type=int, default=MAX_LONG_TEXT_CHARS,
+        help=f"单条文本最大字符数（默认: {MAX_LONG_TEXT_CHARS}，约32k tokens）"
+    )
+    parser.add_argument(
+        "--min_length", type=int, default=MIN_LONG_TEXT_CHARS,
+        help=f"单条文本最小字符数（默认: {MIN_LONG_TEXT_CHARS}，约7.5k tokens）"
+    )
+    parser.add_argument(
+        "--language", type=str, default="en",
+        help="语言过滤（仅对 WanJuanCC 有效，默认: en）"
+    )
+    parser.add_argument(
+        "--subsets", type=str, default=None,
+        help=f"PILES 子集（逗号分隔，默认: {','.join(DEFAULT_PILE_SUBSETS)}）"
+    )
+    parser.add_argument(
+        "--mirror", type=str, default="https://hf-mirror.com",
+        help="HuggingFace 镜像站（仅对 PILES 有效）"
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="数据存储基目录（仅对 WanJuanCC 有效）"
+    )
+    parser.add_argument(
+        "--dry_run", action="store_true",
+        help="Dry run: 仅处理少量数据"
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="忽略已有状态文件，从头开始"
+    )
+
+    args = parser.parse_args()
+
+    # 清除状态文件
+    if args.force:
+        state = StateFile(args.output)
+        state.delete()
+        print("🔶 --force: 已清除状态文件")
+        print()
+
+    # 处理数据
+    if args.dataset == "piles":
+        # 解析子集
+        if args.subsets:
+            subsets = [s.strip() for s in args.subsets.split(",")]
+        else:
+            subsets = DEFAULT_PILE_SUBSETS
+
+        process_piles_dataset(
+            output_path=args.output,
+            target_tokens=args.target_tokens,
+            subsets=subsets,
+            max_length=args.max_length,
+            min_length=args.min_length,
+            dry_run=args.dry_run,
+            mirror=args.mirror,
+        )
+
+    elif args.dataset == "wanjuan":
+        process_wanjuan_dataset(
+            output_path=args.output,
+            target_tokens=args.target_tokens,
+            max_length=args.max_length,
+            min_length=args.min_length,
+            language=args.language,
+            dry_run=args.dry_run,
+            data_dir=args.data_dir,
+        )
 
 
 if __name__ == "__main__":

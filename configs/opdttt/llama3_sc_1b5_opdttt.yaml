@@ -6,7 +6,10 @@
 model:
   # 模型路径（包含分词器和初始化权重）
   model_path: model_assets/llama_1b5_config
-  tokenizer_path: model_assets/llama_1b5_config
+  tokenizer_path: model_assets/tokenizer
+
+  # 词汇表大小（与 tokenizer 一致）
+  vocab_size: 151646
 
   # OPD-TTT 基础设置
   foundation:
@@ -42,8 +45,8 @@ data:
   # 数据基目录
   data_dir: data
 
-  # 训练数据路径
-  train_path: pretrain_1b5_packed.jsonl
+  # 训练数据路径（PILES 长文本数据）
+  train_path: piles_packed_32768.jsonl
 
   # 总训练 Token 数量（60B）
   train_size: 60000000000

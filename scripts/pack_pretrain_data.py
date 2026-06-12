@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Pack short texts into ~32768-token sequences using EOS concatenation.
+"""Pack texts into ~32768-token sequences using EOS concatenation.
+
+This script handles texts of varying lengths (30k+ chars) and concatenates
+them with EOS separator to create fixed-length sequences.
 
 Streaming approach: reads JSONL line by line, concatenates texts with </s>
 separator, and writes packed sequences as new JSONL lines.
+
+Usage:
+    python scripts/pack_pretrain_data.py \\
+        --input data/piles_long_text.jsonl \\
+        --output data/piles_packed_32768.jsonl \\
+        --tokenizer model_assets/tokenizer
 """
 import json
 import os
@@ -10,10 +19,12 @@ import sys
 import time
 from transformers import AutoTokenizer
 
-MAX_SEQ_LEN = 32768
-CHARS_PER_TOKEN = 1.40  # measured from sample
-SEP_CHARS = 4  # length of '</s>' separator
-TARGET_CHARS = int(MAX_SEQ_LEN * CHARS_PER_TOKEN)
+# 打包配置
+MAX_SEQ_LEN = 32768         # 目标序列长度（tokens）
+CHARS_PER_TOKEN = 1.40      # 每个 token 平均字符数
+SEP_CHARS = 4               # EOS 分隔符长度 ('</s>')
+TARGET_CHARS = int(MAX_SEQ_LEN * CHARS_PER_TOKEN)  # 目标字符数
+MIN_INPUT_CHARS = 30000     # 最小输入字符数（约 7.5k tokens）
 
 def pack_data(input_path: str, output_path: str, tokenizer_path: str):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
@@ -71,12 +82,14 @@ def pack_data(input_path: str, output_path: str, tokenizer_path: str):
 
 if __name__ == '__main__':
     import argparse
-    parser = argparse.ArgumentParser(description='Pack short texts into long sequences')
-    parser.add_argument('--input', default='data/pretrain_500m.jsonl',
-                        help='Input JSONL path')
-    parser.add_argument('--output', default='data/pretrain_500m_packed.jsonl',
-                        help='Output JSONL path')
-    parser.add_argument('--tokenizer', default='model_assets/llama_500m_config',
+    parser = argparse.ArgumentParser(
+        description='Pack long texts into ~32768-token sequences for training'
+    )
+    parser.add_argument('--input', default='data/piles_long_text.jsonl',
+                        help='Input JSONL path (texts, min 30k chars)')
+    parser.add_argument('--output', default='data/piles_packed_32768.jsonl',
+                        help='Output JSONL path (packed to ~32768 tokens)')
+    parser.add_argument('--tokenizer', default='model_assets/tokenizer',
                         help='Tokenizer path or name')
     args = parser.parse_args()
     pack_data(
