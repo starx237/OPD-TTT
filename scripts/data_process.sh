@@ -155,8 +155,8 @@ python3 scripts/prepare_pretrain_data.py \
     --output "$RAW_OUTPUT" \
     --target_tokens "$TARGET_TOKENS" \
     --max_length 131072 \
-    --min_length 64000 \
-    --subsets "ArXiv,Books3,Enwiki,PubMed,USPTO" \
+    --min_length 30000 \
+    --subsets "ArXiv,Books3,Wikipedia (en),PubMed Central,Pile-CC,Github" \
     --mirror "$MIRROR" \
     $DRY_RUN
 

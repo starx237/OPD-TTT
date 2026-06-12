@@ -59,6 +59,7 @@ except ImportError:
 try:
     from datasets import load_dataset
     DATASETS_AVAILABLE = True
+    print("[准备中] datasets 库已加载...", flush=True)
 except ImportError:
     DATASETS_AVAILABLE = False
 
@@ -150,6 +151,13 @@ class StateFile:
 
 # ========== PILES 数据集处理 ==========
 
+def configure_download_stability():
+    """配置下载稳定性参数"""
+    # 设置更长的超时时间（秒）
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "300")  # 5分钟
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")  # 禁用 hf-transfer（不稳定）
+    os.environ.setdefault("DATASETS_DOWNLOAD_TIMEOUT", "300")  # 数据集下载超时
+
 def process_piles_dataset(
     output_path: str,
     target_tokens: int,
@@ -185,16 +193,21 @@ def process_piles_dataset(
     # 设置镜像
     os.environ["HF_ENDPOINT"] = mirror
 
-    print(f"{'=' * 60}")
-    print(f"PILES 数据集处理")
-    print(f"{'=' * 60}")
-    print(f"子集: {', '.join(subsets)}")
-    print(f"目标: {target_tokens / 1e9:.0f}B tokens")
-    print(f"输出: {output_path}")
-    print(f"镜像: {mirror}")
+    print(f"\n[启动] 初始化数据处理...", flush=True)
+
+    print(f"{'=' * 60}", flush=True)
+    print(f"PILES 数据集处理", flush=True)
+    print(f"{'=' * 60}", flush=True)
+    print(f"子集: {', '.join(subsets)}", flush=True)
+    print(f"目标: {target_tokens / 1e9:.0f}B tokens", flush=True)
+    print(f"输出: {output_path}", flush=True)
+    print(f"镜像: {mirror}", flush=True)
     if dry_run:
-        print("🔷 DRY RUN: 仅处理少量数据")
-    print()
+        print("🔷 DRY RUN: 仅处理少量数据", flush=True)
+    print(flush=True)
+
+    # 配置下载稳定性
+    configure_download_stability()
 
     state = StateFile(output_path)
     loaded_state = state.load()
@@ -285,12 +298,32 @@ def process_piles_dataset(
                         pct = min(100, subset_tokens / subset_quota * 100) if subset_quota > 0 else 100
                         print(f"  已处理 {total_lines:,} 行, ~{total_tokens/1e9:.2f}B tokens, "
                               f"子集进度: {pct:.1f}%, {rate:.0f} 行/s", flush=True)
+                        # 保存检查点（每10000行保存一次，方便断点续传）
+                        if not dry_run:
+                            current_state = state.load()
+                            current_state["total_tokens"] = total_tokens
+                            current_state["total_lines"] = total_lines
+                            state.save(current_state)
 
                     if dry_run and total_lines >= 100:
                         break
 
         except Exception as e:
-            print(f"  警告: 处理子集 {subset} 失败: {e}")
+            error_msg = str(e)
+            # 保存当前进度
+            if not dry_run:
+                current_state = state.load()
+                current_state["total_tokens"] = total_tokens
+                current_state["total_lines"] = total_lines
+                state.save(current_state)
+
+            # 判断错误类型
+            if any(x in error_msg.lower() for x in ["timeout", "broken pipe", "connection", "network", "disconnected"]):
+                print(f"  警告: 子集 {subset} 网络中断: {e}")
+                print(f"  已保存进度: {total_lines:,} 行, ~{total_tokens/1e9:.2f}B tokens")
+                print(f"  请重新运行脚本继续下载（状态文件已保存）")
+            else:
+                print(f"  警告: 处理子集 {subset} 失败: {e}")
             continue
 
         # 更新状态
@@ -305,11 +338,18 @@ def process_piles_dataset(
             break
 
     overall_elapsed = time.time() - overall_start
+    progress_pct = min(100, total_tokens / target_tokens * 100) if target_tokens > 0 else 100
+
     print(f"\n{'=' * 60}")
     print(f"PILES 处理完成")
     print(f"  耗时: {format_time(overall_elapsed)}")
     print(f"  条数: {total_lines:,}")
-    print(f"  tokens: ~{total_tokens/1e9:.2f}B")
+    print(f"  tokens: ~{total_tokens/1e9:.2f}B / {target_tokens/1e9:.0f}B ({progress_pct:.1f}%)")
+
+    if not dry_run and total_tokens < target_tokens:
+        print(f"\n📋 下载未完成，已保存状态文件")
+        print(f"  状态文件: {output_path}.state.json")
+        print(f"  重新运行脚本将继续下载")
 
     return total_lines, total_tokens
 
