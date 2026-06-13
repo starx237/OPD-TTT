@@ -151,8 +151,8 @@ class StateFile:
         return {
             "version": self.STATE_VERSION,
             "timestamp": time.time(),
-            "processed_subsets": {},  # {subset: {"files": [file1, file2], "tokens": X, "lines": Y}}
-            "processed": [],  # 兼容旧版本 (WanJuanCC)
+            "processed_subsets": {},  # {subset: {"tokens": X, "lines": Y}}
+            "processed": [],  # 兼容旧版本 (WanJuanCC) - 已废弃
             "current_subset": None,   # 当前正在处理的子集
             "total_tokens": 0,
             "total_lines": 0
@@ -161,15 +161,18 @@ class StateFile:
     def _migrate_state(self, state: dict) -> dict:
         """迁移旧版本状态到新版本"""
         # 迁移 processed -> processed_subsets (用于 WanJuanCC 兼容)
-        if "processed" in state and isinstance(state["processed"], list):
+        if "processed" in state and isinstance(state["processed"], list) and state["processed"]:
+            # 只有当 processed 非空时才创建 wanjuan 子集
             if "processed_subsets" not in state:
                 state["processed_subsets"] = {}
-            # 将旧的 processed 列表迁移到 wanjuan 子集
             if "wanjuan" not in state["processed_subsets"]:
-                state["processed_subsets"]["wanjuan"] = {"files": [], "tokens": 0, "lines": 0}
-            for file_path in state["processed"]:
-                if file_path not in state["processed_subsets"]["wanjuan"]["files"]:
-                    state["processed_subsets"]["wanjuan"]["files"].append(file_path)
+                state["processed_subsets"]["wanjuan"] = {"tokens": 0, "lines": 0, "files": []}
+            state["processed_subsets"]["wanjuan"]["files"] = state["processed"][:]
+
+        # 清理旧的 "files" 字段（PILES 子集不再需要，wanjuan 保留）
+        for subset in list(state.get("processed_subsets", {}).keys()):
+            if subset != "wanjuan" and "files" in state["processed_subsets"][subset]:
+                del state["processed_subsets"][subset]["files"]
 
         # 确保必要字段存在
         state.setdefault("version", self.STATE_VERSION)
@@ -299,8 +302,16 @@ class StateFile:
         """更新某子集的 token 数"""
         state = self.load()
         if subset not in state["processed_subsets"]:
-            state["processed_subsets"][subset] = {"files": [], "tokens": 0, "lines": 0}
+            state["processed_subsets"][subset] = {"tokens": 0, "lines": 0}
         state["processed_subsets"][subset]["tokens"] = tokens
+        self.save(state)
+
+    def update_subset_lines(self, subset: str, lines: int) -> None:
+        """更新某子集的行数"""
+        state = self.load()
+        if subset not in state["processed_subsets"]:
+            state["processed_subsets"][subset] = {"tokens": 0, "lines": 0}
+        state["processed_subsets"][subset]["lines"] = lines
         self.save(state)
 
     def delete(self) -> None:
@@ -510,6 +521,13 @@ def process_piles_dataset(
                     download_config=download_config,
                 )
 
+                # 如果子集已部分处理，跳过已处理的 items
+                subset_lines_processed = loaded_state["processed_subsets"].get(subset, {}).get("lines", 0)
+                if subset_lines_processed > 0:
+                    print(f"  跳过已处理的 {subset_lines_processed:,} 行...", flush=True)
+                    import itertools
+                    dataset = itertools.islice(dataset, subset_lines_processed, None)
+
                 # 处理数据
                 subset_count = 0
                 subset_tokens = 0
@@ -541,6 +559,9 @@ def process_piles_dataset(
                         # 每1000条保存一次状态
                         if subset_count % 1000 == 0 and not dry_run:
                             state.set_current_subset(subset, total_tokens, total_lines)
+                            # 更新子集 tokens 和行数计数
+                            state.update_subset_tokens(subset, subset_tokens_processed + subset_tokens)
+                            state.update_subset_lines(subset, subset_lines_processed + subset_count)
 
                         if subset_count % 10000 == 0:
                             print(f"    已处理 {subset_count:,} 行, ~{subset_tokens/1e6:.1f}M tokens", flush=True)
@@ -548,6 +569,7 @@ def process_piles_dataset(
                 # 更新子集处理状态
                 if not dry_run:
                     state.update_subset_tokens(subset, subset_tokens_processed + subset_tokens)
+                    state.update_subset_lines(subset, subset_lines_processed + subset_count)
                     print(f"  ✅ {subset} 本次处理: {subset_count:,} 行, ~{subset_tokens/1e6:.1f}M tokens", flush=True)
 
                 success = True
