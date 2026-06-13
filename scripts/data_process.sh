@@ -175,6 +175,16 @@ fi
 
 log_success "PILES 数据下载完成（耗时: $((${DOWNLOAD_TIME}/60))分钟）"
 
+# 检查下载是否真正完成（达到目标tokens）
+if [ -f "$STATE_FILE" ]; then
+    DOWNLOADED_TOKENS=$(python3 -c "import json; print(int(json.load(open('$STATE_FILE')).get('total_tokens', 0)))")
+    if [ "$DOWNLOADED_TOKENS" -lt "$TARGET_TOKENS" ]; then
+        log_warn "下载未完成: ${DOWNLOADED_TOKENS} / ${TARGET_TOKENS} tokens"
+        log_info "状态文件已保存，下次运行将继续"
+        exit 0  # 正常退出，让看门狗重启
+    fi
+fi
+
 # 检查输出文件
 if [ ! -f "$RAW_OUTPUT" ]; then
     log_error "输出文件不存在: $RAW_OUTPUT"
