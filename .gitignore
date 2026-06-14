@@ -171,6 +171,7 @@ VeOmni/
 # Large generated training data (hundreds of GB, never commit)
 data/
 data/*.jsonl
+data/*.state
 data/*.jsonl.state.json
 data/data_process_*.log
 data/output/

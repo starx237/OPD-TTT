@@ -520,6 +520,7 @@ def build_teacher_model(
     device: torch.device,
     torch_dtype: str = "bfloat16",
     attn_implementation: str = "flash_attention_2",
+    tokenizer=None,
 ) -> Optional[nn.Module]:
     """
     构建教师模型用于蒸馏
@@ -529,6 +530,7 @@ def build_teacher_model(
         device: 设备
         torch_dtype: 数据类型
         attn_implementation: 注意力实现类型
+        tokenizer: 统一的 tokenizer（如果提供，将检查 vocab_size 一致性）
 
     Returns:
         教师模型（如果路径有效），否则返回 None
@@ -546,6 +548,23 @@ def build_teacher_model(
         device_map={"": device},
     )
     teacher_model.eval()
+
+    # 检查 tokenizer vocab_size 一致性
+    if tokenizer is not None:
+        unified_vocab_size = len(tokenizer)
+        teacher_vocab_size = config.vocab_size
+
+        if unified_vocab_size != teacher_vocab_size:
+            logger.warning(
+                f"教师模型 vocab_size ({teacher_vocab_size}) 与 "
+                f"统一 tokenizer vocab_size ({unified_vocab_size}) 不匹配。"
+            )
+            logger.warning(
+                f"请确保使用相同的 tokenizer。"
+                f"建议: bash scripts/setup_teacher.sh --skip-tokenizer <model>"
+            )
+        else:
+            logger.info(f"✓ 教师 vocab_size 与统一 tokenizer 一致: {unified_vocab_size}")
 
     logger.info(f"教师模型已加载: {config.num_hidden_layers} 层, "
                 f"{config.num_attention_heads} 头, hidden_size={config.hidden_size}")
@@ -618,6 +637,11 @@ def main():
         args.data.train_size / (args.train.global_batch_size * args.data.max_seq_len)
     )
 
+    # 构建 collate_fn_kwargs，启用 pad_to_length 确保序列长度一致
+    collate_fn_kwargs = {
+        "pad_to_length": args.data.max_seq_len,  # 将序列 padding 到 max_seq_len
+    }
+
     train_dataloader = build_dataloader(
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
@@ -633,6 +657,7 @@ def main():
         dyn_bsz=getattr(args.train, "dyn_bsz", True),
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
+        collate_fn_kwargs=collate_fn_kwargs,
     )
 
     # 构建学生模型
@@ -697,6 +722,7 @@ def main():
             get_torch_device(),
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
+            tokenizer=tokenizer,  # 传递统一 tokenizer 用于检查 vocab_size 一致性
         )
 
     # 构建优化器和调度器

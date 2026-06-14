@@ -597,6 +597,13 @@ def process_piles_dataset(
     print(f"  条数: {total_lines:,}")
     print(f"  tokens: ~{total_tokens/1e9:.2f}B / {target_tokens/1e9:.0f}B ({progress_pct:.1f}%)")
 
+    # 保存最终状态（更新 totals 并保存）
+    if not dry_run:
+        loaded_state["total_tokens"] = total_tokens
+        loaded_state["total_lines"] = total_lines
+        state.save(loaded_state)
+        print(f"  状态文件已更新: total_tokens={total_tokens/1e9:.2f}B, total_lines={total_lines:,}")
+
     if not dry_run and total_tokens < target_tokens:
         print(f"\n📋 下载未完成，已保存状态文件")
         print(f"  状态文件: {output_path}.state.json")

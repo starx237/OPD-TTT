@@ -94,7 +94,7 @@ train:
   wandb_project: opdttt-experiments
   wandb_name: 500m-opdttt
 
-  # 最大训练步数（20B / 2.09M ≈ 9575 步）
+  # 最大训练步数（20B / 2M ≈ 9575 步）
   max_steps: 9575
 
   # RMPad 位置 ID 选项
@@ -166,7 +166,8 @@ train:
 # ========== OPD-TTT 特定参数 ==========
 opdttt:
   # 教师模型路径（留空则不使用教师，等同于纯 TTT）
-  teacher_model_path: ""
+  # 使用 bash scripts/setup_teacher.sh qwen2.5-7b 下载
+  teacher_model_path: "model_assets/teacher_qwen2.5_7b"
 
   # 启用教师输出缓存
   enable_teacher_cache: true

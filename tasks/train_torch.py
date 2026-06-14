@@ -167,6 +167,8 @@ def _build_dataloader_compat(args, train_dataset, train_steps):
         dyn_bsz_margin=getattr(args.train, "dyn_bsz_margin", 0),
         dyn_bsz_buffer_size=getattr(args.data, "dyn_bsz_buffer_size", getattr(args.train, "dyn_bsz_buffer_size", 500)),
         dyn_bsz=getattr(args.train, "dyn_bsz", getattr(args.train, "rmpad", True)),
+        # 启用 pad_to_length 确保序列长度一致
+        collate_fn_kwargs={"pad_to_length": args.data.max_seq_len},
     )
     try:
         from veomni.data.data_loader import DATALOADER_REGISTRY

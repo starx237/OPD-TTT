@@ -202,28 +202,58 @@ fi
 # ============================================================================
 # 步骤 4: 数据打包
 # ============================================================================
-log_info "开始数据打包..."
-log_info "  - 输入: $RAW_OUTPUT"
-log_info "  - 输出: $PACKED_OUTPUT"
-log_info "  - 目标长度: ~32768 tokens"
 
-PACK_START=$(date +%s)
+# 检查打包文件是否已存在
+if [ -f "$PACKED_OUTPUT" ] && [ -s "$PACKED_OUTPUT" ]; then
+    # 检查文件是否完整（通过与输入文件比较行数）
+    PACK_COMPLETE=false
+
+    # 简单检查：如果打包文件大小接近输入文件大小且不为空
+    INPUT_SIZE=$(stat -f%z "$RAW_OUTPUT" 2>/dev/null || stat -c%s "$RAW_OUTPUT" 2>/dev/null)
+    PACK_SIZE=$(stat -f%z "$PACKED_OUTPUT" 2>/dev/null || stat -c%s "$PACKED_OUTPUT" 2>/dev/null)
+
+    # 如果打包文件存在且大小合理（至少是输入文件的50%），认为是完整的
+    if [ "$PACK_SIZE" -gt $((INPUT_SIZE / 2)) ]; then
+        PACK_COMPLETE=true
+    fi
+
+    if [ "$PACK_COMPLETE" = true ]; then
+        log_success "数据打包文件已存在且完整，跳过打包步骤"
+        log_info "  - 输出文件: $PACKED_OUTPUT"
+        log_info "  - 文件大小: $(($PACK_SIZE / 1024 / 1024)) MB"
+    else
+        log_warn "打包文件可能不完整，将重新打包"
+        rm -f "$PACKED_OUTPUT"
+    fi
+fi
+
+if [ ! -f "$PACKED_OUTPUT" ]; then
+    log_info "开始数据打包..."
+    log_info "  - 输入: $RAW_OUTPUT"
+    log_info "  - 输出: $PACKED_OUTPUT"
+    log_info "  - 目标长度: ~32768 tokens"
+
+    PACK_START=$(date +%s)
 
 python3 scripts/pack_pretrain_data.py \
     --input "$RAW_OUTPUT" \
     --output "$PACKED_OUTPUT" \
     --tokenizer model_assets/tokenizer
 
-PACK_STATUS=$?
-PACK_END=$(date +%s)
-PACK_TIME=$((PACK_END - PACK_START))
+    PACK_STATUS=$?
+    PACK_END=$(date +%s)
+    PACK_TIME=$((PACK_END - PACK_START))
 
-if [ $PACK_STATUS -ne 0 ]; then
-    log_error "数据打包失败（耗时: ${PACK_TIME}s）"
-    exit 1
+    if [ $PACK_STATUS -ne 0 ]; then
+        log_error "数据打包失败（耗时: ${PACK_TIME}s）"
+        exit 1
+    fi
+
+    log_success "数据打包完成（耗时: ${PACK_TIME}s）"
+else
+    # 打包文件已存在，跳过打包
+    PACK_STATUS=0
 fi
-
-log_success "数据打包完成（耗时: ${PACK_TIME}s）"
 
 # ============================================================================
 # 步骤 5: 验证结果
@@ -247,9 +277,16 @@ total_chars = 0
 count = 0
 min_chars = float('inf')
 max_chars = 0
+empty_lines = 0
+error_lines = 0
 
 with open(output_file, 'r') as f:
-    for line in f:
+    for line_num, line in enumerate(f, 1):
+        # 跳过空行
+        if not line.strip():
+            empty_lines += 1
+            continue
+
         try:
             data = json.loads(line)
             text_len = len(data['content_split'])
@@ -258,8 +295,13 @@ with open(output_file, 'r') as f:
             min_chars = min(min_chars, text_len)
             max_chars = max(max_chars, text_len)
         except Exception as e:
-            print(f'✗ 解析行失败: {e}', file=sys.stderr)
-            sys.exit(1)
+            error_lines += 1
+            print(f'⚠️  第 {line_num} 行解析失败: {e}', file=sys.stderr)
+            if error_lines <= 3:
+                print(f'  行内容预览: {line[:100]}...', file=sys.stderr)
+            if error_lines > 10:
+                print(f'✗ 错误行过多（>10），停止验证', file=sys.stderr)
+                sys.exit(1)
 
 if count == 0:
     print('✗ 没有有效的数据行', file=sys.stderr)
@@ -270,6 +312,10 @@ avg_tokens = avg_chars / 4
 
 print(f'✓ 数据验证成功')
 print(f'  总行数: {count:,}')
+if empty_lines > 0:
+    print(f'  跳过空行: {empty_lines:,}')
+if error_lines > 0:
+    print(f'  错误行数: {error_lines:,}')
 print(f'  平均字符数: {avg_chars:.0f}')
 print(f'  平均 tokens: {avg_tokens:.0f}')
 print(f'  最小字符数: {min_chars:.0f}')
@@ -293,6 +339,34 @@ fi
 TOTAL_END=$(date +%s)
 TOTAL_TIME=$((TOTAL_END - DOWNLOAD_START))
 
+# 创建完成标记文件
+COMPLETION_MARKER="$PROJECT_ROOT/.cache/data_processing_complete"
+mkdir -p "$(dirname "$COMPLETION_MARKER")"
+echo "完成时间: $(date)" > "$COMPLETION_MARKER"
+echo "原始数据: $RAW_OUTPUT" >> "$COMPLETION_MARKER"
+echo "打包数据: $PACKED_OUTPUT" >> "$COMPLETION_MARKER"
+
+# ============================================================================
+# 步骤 6: 创建验证集
+# ============================================================================
+log_info "创建验证集..."
+
+VAL_OUTPUT="data/val/pile_val.jsonl"
+mkdir -p "$(dirname "$VAL_OUTPUT")"
+
+python3 scripts/create_val_set.py \
+    --input "$RAW_OUTPUT" \
+    --output "$VAL_OUTPUT" \
+    --num_samples 1000 \
+    --min_chars 30000
+
+if [ $? -eq 0 ]; then
+    log_success "验证集创建完成: $VAL_OUTPUT"
+else
+    log_error "验证集创建失败"
+    exit 1
+fi
+
 echo ""
 log_success "数据处理完成！"
 echo "总耗时: $((${TOTAL_TIME}/60))分钟"
@@ -300,10 +374,14 @@ echo ""
 echo "输出文件:"
 echo "  - 原始数据: $RAW_OUTPUT"
 echo "  - 打包数据: $PACKED_OUTPUT"
+echo "  - 验证集: $VAL_OUTPUT"
 echo "  - 日志文件: $LOG_FILE"
 echo ""
 echo "下一步:"
 echo "  1. 检查数据质量: head -n 1 $PACKED_OUTPUT"
 echo "  2. 查看日志: tail -n 50 $LOG_FILE"
 echo "  3. 开始训练: bash scripts/train_opdttt_500m.sh"
+echo "  4. 评估模型: python scripts/eval_sliding_window_ppl.py --model_path ... --val_data_path $VAL_OUTPUT"
 echo ""
+log_info "完成标记已创建: $COMPLETION_MARKER"
+log_info "看门狗检测到此标记后将自动停止"

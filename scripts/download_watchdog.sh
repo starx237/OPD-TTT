@@ -43,6 +43,15 @@ get_latest_log() {
     ls -t ${LOG_DIR}/data_process_*.log 2>/dev/null | head -1
 }
 
+# 检查数据处理是否完成
+check_data_processing_complete() {
+    local completion_marker="$PROJECT_ROOT/.cache/data_processing_complete"
+    if [ -f "$completion_marker" ]; then
+        return 0  # 数据处理已完成
+    fi
+    return 1  # 数据处理未完成
+}
+
 # 检查日志中是否有网络错误
 check_network_error() {
     local log_file="$1"
@@ -142,9 +151,36 @@ kill_stuck_process() {
 watchdog_loop() {
     log_info "看门狗启动 (PID: $$), 检查间隔: ${CHECK_INTERVAL}秒"
 
+    # 首次检查：是否已有下载进程
+    local download_pid=$(get_download_pid)
+    if [ -n "$download_pid" ]; then
+        log_info "检测到已有下载进程运行 (PID: $download_pid)，将监控现有进程"
+    else
+        log_info "未检测到下载进程，将立即启动下载"
+        start_download
+    fi
+
     while true; do
+        # 检查数据处理是否已完成
+        if check_data_processing_complete; then
+            log_info "检测到数据处理已完成，看门狗将停止"
+            log_info "完成标记文件: $PROJECT_ROOT/.cache/data_processing_complete"
+
+            # 停止下载进程（如果还在运行）
+            download_pid=$(get_download_pid)
+            if [ -n "$download_pid" ]; then
+                log_info "停止下载进程 (PID: $download_pid)"
+                kill_download
+            fi
+
+            # 删除看门狗PID文件并退出
+            rm -f "$WATCHDOG_PID_FILE"
+            log_info "看门狗已停止"
+            exit 0
+        fi
+
         # 检查是否有下载进程在运行
-        local download_pid=$(get_download_pid)
+        download_pid=$(get_download_pid)
 
         if [ -z "$download_pid" ]; then
             log_info "没有下载进程在运行，启动下载..."
@@ -203,6 +239,15 @@ start_watchdog() {
             log_info "看门狗已在运行 (PID: $pid)"
             return 0
         fi
+    fi
+
+    # 检查是否已有下载进程在运行
+    local existing_download=$(get_download_pid)
+    if [ -n "$existing_download" ]; then
+        log_info "检测到下载进程已运行 (PID: $existing_download)"
+        log_info "看门狗将监控现有进程，不会重复启动"
+    else
+        log_info "未检测到下载进程，看门狗启动后将自动开始下载"
     fi
 
     # 后台运行看门狗
