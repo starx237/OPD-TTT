@@ -282,7 +282,8 @@ class OPDTTTMLP(nn.Module):
         ntp_proj = ntp_proj.to(dtype)
 
         # 2. 教师表示对齐分量：使 MLP 输出与教师表示对齐
-        if teacher_repr is not None:
+        # 只有当 lambda_align_rep > 0 时才计算教师对齐
+        if self.lambda_align_rep > 0 and teacher_repr is not None:
             teacher_repr_float = teacher_repr[:, :-1].float() if teacher_repr.dtype == torch.bfloat16 else teacher_repr[:, :-1]
             teacher_proj_weight = self.teacher_proj.weight.float() if self.teacher_proj.weight.dtype == torch.bfloat16 else self.teacher_proj.weight
             teacher_align = torch.einsum(
@@ -294,36 +295,41 @@ class OPDTTTMLP(nn.Module):
             # 转换回原始 dtype
             teacher_align = teacher_align.to(dtype)
         else:
-            # 如果没有提供教师，使用零向量
-            teacher_align = torch.zeros_like(ntp_proj)
+            # 如果没有提供教师或 lambda_align_rep=0，使用零向量
+            teacher_align = None
 
         # 合并两个梯度分量
         # 根据配置使用固定权重或自适应权重
-        if self.weight_adaptation == "adaptive" and teacher_repr is not None:
-            # 自适应权重：根据梯度的余弦相似度动态调整权重
-            # 公式：λ_align_rep^(i) = λ_align_rep * (1 + cos(g_NTP, g_teacher)) / 2
-            # 其中 g_NTP = ntp_proj, g_teacher = teacher_align
+        if self.lambda_align_rep > 0 and teacher_align is not None:
+            # 有教师对齐的情况
+            if self.weight_adaptation == "adaptive":
+                # 自适应权重：根据梯度的余弦相似度动态调整权重
+                # 公式：λ_align_rep^(i) = λ_align_rep * (1 + cos(g_NTP, g_teacher)) / 2
+                # 其中 g_NTP = ntp_proj, g_teacher = teacher_align
 
-            # 展平梯度以便计算相似度
-            # [batch, chunks, hidden, intermediate] -> [batch * chunks, hidden * intermediate]
-            ntp_grad_flat = ntp_proj.reshape(bs, -1)
-            teacher_grad_flat = teacher_align.reshape(bs, -1)
+                # 展平梯度以便计算相似度
+                # [batch, chunks, hidden, intermediate] -> [batch * chunks, hidden * intermediate]
+                ntp_grad_flat = ntp_proj.reshape(bs, -1)
+                teacher_grad_flat = teacher_align.reshape(bs, -1)
 
-            # 计算余弦相似度（分块级别）
-            # 相似度范围 [-1, 1]，映射到 [0, 1] 后用作权重系数
-            cos_sim = F.cosine_similarity(ntp_grad_flat, teacher_grad_flat, dim=-1)  # [batch]
-            # 将相似度从 [-1, 1] 映射到 [0, 1]
-            similarity_coeff = (cos_sim + 1) / 2  # [batch]
-            # 形状调整以便广播
-            similarity_coeff = similarity_coeff.view(bs, 1, 1, 1)  # [batch, 1, 1, 1]
+                # 计算余弦相似度（分块级别）
+                # 相似度范围 [-1, 1]，映射到 [0, 1] 后用作权重系数
+                cos_sim = F.cosine_similarity(ntp_grad_flat, teacher_grad_flat, dim=-1)  # [batch]
+                # 将相似度从 [-1, 1] 映射到 [0, 1]
+                similarity_coeff = (cos_sim + 1) / 2  # [batch]
+                # 形状调整以便广播
+                similarity_coeff = similarity_coeff.view(bs, 1, 1, 1)  # [batch, 1, 1, 1]
 
-            # 动态调整权重：梯度方向相似时增加权重，冲突时减少权重
-            adaptive_lambda_align = self.lambda_align_rep * similarity_coeff
+                # 动态调整权重：梯度方向相似时增加权重，冲突时减少权重
+                adaptive_lambda_align = self.lambda_align_rep * similarity_coeff
 
-            weighted_update = (ntp_proj * self.lambda_ntp + teacher_align * adaptive_lambda_align) * self.ttt_lr
+                weighted_update = (ntp_proj * self.lambda_ntp + teacher_align * adaptive_lambda_align) * self.ttt_lr
+            else:
+                # 固定权重：使用配置的固定权重值
+                weighted_update = (ntp_proj * self.lambda_ntp + teacher_align * self.lambda_align_rep) * self.ttt_lr
         else:
-            # 固定权重：使用配置的固定权重值
-            weighted_update = (ntp_proj * self.lambda_ntp + teacher_align * self.lambda_align_rep) * self.ttt_lr
+            # 没有教师对齐的情况（lambda_align_rep=0 或没有教师）
+            weighted_update = ntp_proj * self.lambda_ntp * self.ttt_lr
 
         d_down_proj = torch.cat(
             [
@@ -348,7 +354,8 @@ class OPDTTTMLP(nn.Module):
         loss_dict = {
             "ntp_loss": self._compute_repr_loss(output[:, :-1], ntp_target_3d[:, 1:]),
         }
-        if teacher_repr is not None:
+        # 只有当 lambda_align_rep > 0 时才计算教师表示对齐损失
+        if self.lambda_align_rep > 0 and teacher_repr is not None:
             teacher_repr_3d = rearrange(teacher_repr, "b t c d -> b (t c) d")
             # 将教师表示投影到学生模型的 hidden_size
             # teacher_repr_3d: [batch, seq_len, teacher_hidden_size]

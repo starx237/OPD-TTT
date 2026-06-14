@@ -1,0 +1,85 @@
+# 阶段1：基础TTT预训练（无教师）
+# 目标：建立基础语言建模能力和TTT机制
+# 对应OPD论文中的pre-training阶段
+
+# ========== 模型配置 ==========
+model:
+  model_path: model_assets/llama_500m_config
+  tokenizer_path: model_assets/tokenizer
+  vocab_size: 151665
+
+  # TTT基础设置（无教师）
+  foundation:
+    opdttt_mode: true
+    opdttt_layers: [0, 6, 12, 18]
+    ttt_proj: true
+    ttt_lr: 0.3
+    ttt_chunk: 4096
+    ttt_target: input_embed
+
+    # 阶段1损失权重：只有语言建模和NTP对齐
+    lambda_ntp: 1.0           # NTP对齐（自监督）
+    lambda_align_rep: 0.0    # 无教师表示对齐
+    lambda_kl: 0.0           # 无KL散度
+    lambda_lm: 1.0            # 语言建模
+
+# ========== 数据配置 ==========
+data:
+  data_dir: data
+  train_path: data/piles_packed_32768.jsonl
+  train_size: 20000000000     # 20B tokens
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 32768
+  text_keys: content_split
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/500m_stage1_pretrain
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 66    # 修改为6的倍数，适配6 GPU (micro_batch_size=1)
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: 500m-stage1-pretrain
+  max_steps: 9575              # 20B / 2M ≈ 9575步
+  optimizer: adamw
+  lr: 5.0e-4
+  lr_warmup_ratio: 0.10
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  lr_min: 5.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: false
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  ckpt_manager: dcp
+  save_checkpoint_path: data/output/500m_stage1_pretrain/checkpoints
+  save_steps: 500
+  save_hf_weights: true
+  empty_cache_steps: 10
+  seed: 42
+
+# ========== 阶段1特定参数（无教师）==========
+opdttt:
+  # 阶段1不使用教师
+  teacher_model_path: ""
+
+  # TTT参数
+  ttt_lr: 0.3
+  ttt_chunk: 4096
+  ttt_proj: true
+  opdttt_layers: [0, 6, 12, 18]
+
+  # 阶段1不需要PCA和自适应权重
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"

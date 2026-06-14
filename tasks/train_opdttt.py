@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import trange
 import wandb
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -57,6 +58,12 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:False"
 elif "expandable_segments" not in os.environ["PYTORCH_CUDA_ALLOC_CONF"]:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] += ",expandable_segments:False"
+
+# 添加项目根目录到 Python 路径（用于导入本地模块）
+_current_file_path = os.path.abspath(__file__)
+_project_root = os.path.dirname(os.path.dirname(_current_file_path))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 # 导入自定义模型
 import hf_models.hf_llama  # noqa: F401
@@ -169,6 +176,36 @@ class OPDTTTArguments:
     teacher_embeddings_path: str = field(
         default="",
         metadata={"help": "用于 PCA 初始化的教师嵌入文件路径（.pt 格式）"},
+    )
+
+    # OPD采样参数（阶段2：On-Policy Distillation）
+    enable_opd_sampling: bool = field(
+        default=False,
+        metadata={"help": "启用OPD on-policy采样（阶段2）"},
+    )
+    opd_disable_ttt: bool = field(
+        default=True,
+        metadata={"help": "OPD采样时禁用TTT（保持采样和训练一致）"},
+    )
+    opd_temperature: float = field(
+        default=1.0,
+        metadata={"help": "OPD采样温度"},
+    )
+    opd_top_p: float = field(
+        default=0.9,
+        metadata={"help": "OPD采样top-p（nucleus sampling）"},
+    )
+    opd_max_sample_length: int = field(
+        default=2048,
+        metadata={"help": "OPD最大采样长度"},
+    )
+    opd_num_trajectories: int = field(
+        default=1,
+        metadata={"help": "每个prompt的采样轨迹数"},
+    )
+    opd_prompt_field: str = field(
+        default="prompt",
+        metadata={"help": "OPD数据集中的prompt字段名"},
     )
 
 
@@ -298,6 +335,394 @@ class OPDTTTTrainer:
 
         return result
 
+    def sample_from_student(
+        self,
+        prompts: Dict[str, torch.Tensor],
+        num_trajectories: int = 1,
+    ) -> List[Dict[str, torch.Tensor]]:
+        """
+        从学生模型采样轨迹（OPD核心步骤）
+
+        注意：TTT快速权重会在采样过程中更新以适应prompt，
+        但这些更新不参与梯度计算（TTT作为inference时适应机制）
+
+        Args:
+            prompts: 包含prompt的批次数据
+            num_trajectories: 每个prompt的采样轨迹数
+
+        Returns:
+            采样轨迹列表，每个轨迹包含input_ids和采样logprobs
+        """
+        self.student_model.eval()
+        trajectories = []
+
+        prompt_ids = prompts["input_ids"].to(self.device)
+        attention_mask = prompts.get("attention_mask")
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        batch_size = prompt_ids.shape[0]
+
+        for i in range(num_trajectories):
+            for b in range(batch_size):
+                # 单个prompt采样
+                single_prompt = {
+                    "input_ids": prompt_ids[b:b+1],
+                    "attention_mask": attention_mask[b:b+1] if attention_mask is not None else None,
+                }
+
+                with torch.no_grad():
+                    # 使用学生模型的generate方法进行采样
+                    # 注意：这里TTT快速权重会更新以适应prompt
+                    # 但这些更新不参与梯度计算（TTT作为inference适应机制）
+                    # 在后续重新计算logprobs时，TTT会重新从头开始
+                    sampled_ids = []
+                    sampled_logprobs = []
+                    current_input = single_prompt["input_ids"]
+
+                    max_length = min(
+                        single_prompt["input_ids"].shape[1] + self.args.opdttt.opd_max_sample_length,
+                        self.args.data.max_seq_len,
+                    )
+
+                    # 自回归采样
+                    for step in range(max_length - single_prompt["input_ids"].shape[1]):
+                        # 学生前向传播获取logits（TTT快速权重会更新）
+                        outputs = self.student_model(
+                            input_ids=current_input,
+                            attention_mask=single_prompt["attention_mask"],
+                            use_cache=False,
+                        )
+
+                        next_token_logits = outputs.logits[:, -1, :]  # [1, vocab_size]
+
+                        # 应用温度和top-p采样
+                        if self.args.opdttt.opd_temperature > 0:
+                            next_token_logits = next_token_logits / self.args.opdttt.opd_temperature
+
+                        # 计算logprobs（仅用于采样，不保留梯度）
+                        next_token_logprobs = F.log_softmax(next_token_logits, dim=-1)
+
+                        # Top-p (nucleus) sampling
+                        if self.args.opdttt.opd_top_p < 1.0:
+                            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                            sorted_indices_to_remove = cumulative_probs > self.args.opdttt.opd_top_p
+                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                            sorted_indices_to_remove[..., 0] = 0
+                            indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                            next_token_logits[:, indices_to_remove] = float('-inf')
+
+                        # 采样下一个token
+                        probs = F.softmax(next_token_logits, dim=-1)
+                        next_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
+                        next_token_logprob = next_token_logprobs.gather(-1, next_token).squeeze(-1)
+
+                        sampled_ids.append(next_token)
+                        sampled_logprobs.append(next_token_logprob)
+
+                        # 检查是否生成EOS
+                        if next_token.item() == self.tokenizer.eos_token_id:
+                            break
+
+                        # 更新输入
+                        current_input = torch.cat([current_input, next_token], dim=-1)
+
+                        # 更新attention mask
+                        if single_prompt["attention_mask"] is not None:
+                            single_prompt["attention_mask"] = torch.cat(
+                                [single_prompt["attention_mask"], torch.ones_like(next_token)], dim=-1
+                            )
+
+                # 构建完整轨迹
+                full_input_ids = torch.cat([single_prompt["input_ids"], torch.cat(sampled_ids, dim=-1)], dim=-1)
+                full_logprobs = torch.cat(sampled_logprobs, dim=-1) if sampled_logprobs else None
+
+                trajectories.append({
+                    "input_ids": full_input_ids,
+                    "sampled_logprobs": full_logprobs,  # 采样时的logprobs（no_grad）
+                    "prompt_length": single_prompt["input_ids"].shape[1],
+                })
+
+        self.student_model.train()
+        return trajectories
+
+    def compute_teacher_logprobs_on_sampled(
+        self,
+        trajectories: List[Dict[str, torch.Tensor]],
+    ) -> List[torch.Tensor]:
+        """
+        计算教师在学生采样token上的logprobs（OPD核心步骤）
+
+        Args:
+            trajectories: 学生采样轨迹列表
+
+        Returns:
+            教师logprobs列表，与轨迹对应
+        """
+        if self.teacher_model is None:
+            return None
+
+        teacher_logprobs_list = []
+
+        for trajectory in trajectories:
+            input_ids = trajectory["input_ids"].to(self.device)
+            prompt_length = trajectory["prompt_length"]
+
+            # 只需要计算采样部分的教师logprobs
+            if input_ids.shape[1] <= prompt_length:
+                continue
+
+            sampled_ids = input_ids[:, prompt_length:]
+
+            with torch.no_grad():
+                # 教师前向传播
+                outputs = self.teacher_model(
+                    input_ids=input_ids,
+                    attention_mask=torch.ones_like(input_ids),
+                    use_cache=False,
+                )
+
+                # 获取采样位置的logits
+                sampled_logits = outputs.logits[:, prompt_length-1:-1, :]  # [1, sampled_length-1, vocab_size]
+
+                # 计算教师logprobs
+                teacher_logprobs = F.log_softmax(sampled_logits, dim=-1)
+
+                # 提取实际采样token的logprob
+                # teacher_logprobs: [1, sampled_length-1, vocab_size]
+                # sampled_ids[1:]: [1, sampled_length-1] (去掉第一个生成的token，因为它的logprob来自prompt)
+                sampled_tokens = sampled_ids[:, 1:] if sampled_ids.shape[1] > 1 else sampled_ids
+                if sampled_tokens.shape[1] > 0:
+                    sampled_tokens_reshaped = sampled_tokens.unsqueeze(-1)  # [1, sampled_length-1, 1]
+                    # 将teacher_logprobs调整到匹配维度
+                    if teacher_logprobs.shape[1] != sampled_tokens.shape[1]:
+                        # 处理维度不匹配的情况
+                        min_len = min(teacher_logprobs.shape[1], sampled_tokens.shape[1])
+                        teacher_logprobs = teacher_logprobs[:, :min_len, :]
+                        sampled_tokens_reshaped = sampled_tokens_reshaped[:, :min_len, :]
+
+                    teacher_logprobs_on_sampled = teacher_logprobs.gather(-1, sampled_tokens_reshaped).squeeze(-1)
+                    teacher_logprobs_list.append(teacher_logprobs_on_sampled)
+
+        return teacher_logprobs_list
+
+    def compute_importance_sampling_loss(
+        self,
+        trajectories: List[Dict[str, torch.Tensor]],
+        teacher_logprobs_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        计算重要性采样损失（OPD核心）
+
+        正确的实现：
+        1. reverse KL作为advantage，必须detach（reward信号）
+        2. 重要性权重rho：分子保留梯度，分母detach
+           rho = exp(student_logprob - student_logprob.detach())
+           在OPD中，因为theta_old = theta，所以rho = 1，但梯度保留
+
+        Args:
+            trajectories: 学生采样轨迹
+            teacher_logprobs_list: 教师在采样token上的logprobs
+
+        Returns:
+            重要性采样损失
+        """
+        total_loss = 0.0
+        total_tokens = 0
+
+        for trajectory, teacher_logprobs in zip(trajectories, teacher_logprobs_list):
+            if teacher_logprobs is None:
+                continue
+
+            # 学生的采样logprobs（需要保留梯度）
+            student_logprobs = trajectory["sampled_logprobs"]
+
+            if student_logprobs is None or teacher_logprobs is None:
+                continue
+
+            # 对齐维度
+            min_len = min(student_logprobs.shape[0], teacher_logprobs.shape[1])
+            if min_len == 0:
+                continue
+
+            student_logprobs = student_logprobs[:min_len]
+            teacher_logprobs = teacher_logprobs[0, :min_len]
+
+            # 计算reverse KL作为advantage（必须detach，作为reward信号）
+            # reverse_KL = student_logprob - teacher_logprob
+            # advantage = -reverse_KL = teacher_logprob - student_logprob
+            reverse_kl = (student_logprobs.detach() - teacher_logprobs.detach())
+            advantages = -reverse_kl  # = teacher_logprob - student_logprob
+
+            # 重要性采样权重（关键：分子保留梯度，分母detach）
+            # 在标准RL中：rho = pi_theta(a|s) / pi_theta_old(a|s)
+            # 在OPD中：theta_old = theta，所以：
+            # rho = exp(logprob) / exp(logprob.detach()) = exp(logprob - logprob.detach())
+            # 数值上rho = 1，但梯度保留在分子中
+            rho = torch.exp(student_logprobs - student_logprobs.detach())
+
+            # 重要性采样策略梯度损失
+            # loss = -rho * advantage
+            # 这确保梯度能正确传播到student_logprobs
+            loss_per_token = -rho * advantages
+
+            total_loss += loss_per_token.sum()
+            total_tokens += min_len
+
+        if total_tokens > 0:
+            return total_loss / total_tokens
+        else:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def train_step_opd(
+        self,
+        prompts_batch: Dict[str, torch.Tensor],
+    ) -> float:
+        """
+        OPD模式的训练步骤（真正的on-policy distillation）
+
+        正确的两阶段流程：
+        1. 采样阶段（no_grad）：从学生模型采样轨迹
+        2. 训练阶段（保留梯度）：
+           a. 重新计算采样token的logprobs（保留梯度）
+           b. 计算教师logprobs（detach）
+           c. 计算reverse KL作为advantage（detach）
+           d. 使用重要性采样损失进行梯度更新
+
+        Args:
+            prompts_batch: 包含prompt的批次数据
+
+        Returns:
+            该批次的损失值
+        """
+        # 准备批次数据
+        prompts_batch = {
+            k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+            for k, v in prompts_batch.items()
+        }
+
+        # 阶段1: 采样（no_grad）- 获取轨迹
+        trajectories = self.sample_from_student(
+            prompts=prompts_batch,
+            num_trajectories=self.args.opdttt.opd_num_trajectories,
+        )
+
+        if not trajectories:
+            return 0.0
+
+        # 阶段2: 训练（保留梯度）
+        # 2a. 重新计算采样token的logprobs（一次前向传播，保留梯度！）
+        # 注意：这里使用一次前向传播计算整个序列的logprobs，避免重复自回归
+        # TTT更新可能会有微小差异，但避免了巨大的计算开销
+        for trajectory in trajectories:
+            input_ids = trajectory["input_ids"]
+            prompt_length = trajectory["prompt_length"]
+
+            if input_ids.shape[1] <= prompt_length:
+                trajectory["student_logprobs_with_grad"] = None
+                continue
+
+            # 重新计算学生logprobs（一次前向传播，保留梯度！）
+            outputs = self.student_model(
+                input_ids=input_ids,
+                attention_mask=torch.ones_like(input_ids),
+                use_cache=False,
+            )
+
+            # 获取采样位置的logits
+            # 注意：采样位置的第一个token（prompt后第一个）的logprob在position prompt_length-1
+            sampled_logits = outputs.logits[:, prompt_length-1:-1, :]
+            sampled_logprobs = F.log_softmax(sampled_logits, dim=-1)
+
+            # 提取采样token的logprob
+            # 采样token从prompt_length+1开始（因为我们预测下一个token）
+            sampled_ids = input_ids[:, prompt_length+1:] if input_ids.shape[1] > prompt_length + 1 else input_ids[:, prompt_length:]
+
+            if sampled_ids.shape[1] > 0 and sampled_logprobs.shape[1] == sampled_ids.shape[1]:
+                sampled_ids_reshaped = sampled_ids.unsqueeze(-1)
+                student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
+                trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
+            else:
+                trajectory["student_logprobs_with_grad"] = None
+
+        # 2b. 计算教师logprobs（detach）
+        teacher_logprobs_list = self.compute_teacher_logprobs_on_sampled(trajectories)
+
+        # 2c & 2d. 计算重要性采样损失（使用有梯度的学生logprobs）
+        loss = self.compute_importance_sampling_loss_with_grad(
+            trajectories,
+            teacher_logprobs_list,
+        )
+
+        # 反向传播
+        with self.model_bwd_context:
+            loss.backward()
+
+        return loss.item()
+
+    def compute_importance_sampling_loss_with_grad(
+        self,
+        trajectories: List[Dict[str, torch.Tensor]],
+        teacher_logprobs_list: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        计算重要性采样损失（使用重新计算的、带梯度的logprobs）
+
+        Args:
+            trajectories: 学生采样轨迹（包含重新计算的logprobs）
+            teacher_logprobs_list: 教师在采样token上的logprobs
+
+        Returns:
+            重要性采样损失
+        """
+        total_loss = 0.0
+        total_tokens = 0
+
+        for trajectory, teacher_logprobs in zip(trajectories, teacher_logprobs_list):
+            if teacher_logprobs is None:
+                continue
+
+            # 使用重新计算的、带梯度的学生logprobs
+            student_logprobs = trajectory.get("student_logprobs_with_grad")
+
+            if student_logprobs is None or teacher_logprobs is None:
+                continue
+
+            # student_logprobs形状: [sampled_length]
+            # teacher_logprobs形状: [1, sampled_length]
+
+            # 对齐维度
+            min_len = min(student_logprobs.shape[0], teacher_logprobs.shape[1])
+            if min_len == 0:
+                continue
+
+            student_logprobs = student_logprobs[:min_len]
+            teacher_logprobs = teacher_logprobs[0, :min_len]
+
+            # 计算reverse KL作为advantage（必须detach）
+            # reverse_KL = student_logprob - teacher_logprob
+            # advantage = -reverse_KL = teacher_logprob - student_logprob
+            reverse_kl = (student_logprobs.detach() - teacher_logprobs.detach())
+            advantages = -reverse_kl
+
+            # 重要性采样权重（分子保留梯度，分母detach）
+            # rho = exp(student_logprob - student_logprob.detach())
+            # 在OPD中theta_old=theta，所以rho数值上=1，但梯度保留
+            rho = torch.exp(student_logprobs - student_logprobs.detach())
+
+            # 重要性采样策略梯度损失
+            # loss = -rho * advantage
+            loss_per_token = -rho * advantages
+
+            total_loss += loss_per_token.sum()
+            total_tokens += min_len
+
+        if total_tokens > 0:
+            return total_loss / total_tokens
+        else:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
     def train_step(
         self,
         micro_batch: Dict[str, torch.Tensor],
@@ -389,6 +814,17 @@ class OPDTTTTrainer:
         if self.teacher_model is not None:
             self.teacher_model.eval()
 
+        # 检查是否启用OPD模式
+        enable_opd = self.args.opdttt.enable_opd_sampling
+        if enable_opd:
+            logger.info("========== OPD模式：On-Policy Distillation ==========")
+            logger.info(f"采样温度: {self.args.opdttt.opd_temperature}")
+            logger.info(f"Top-p: {self.args.opdttt.opd_top_p}")
+            logger.info(f"最大采样长度: {self.args.opdttt.opd_max_sample_length}")
+            logger.info(f"轨迹数: {self.args.opdttt.opd_num_trajectories}")
+        else:
+            logger.info("========== 标准模式：Teacher-Student训练 ==========")
+
         logger.info(
             f"开始训练: 步数={train_steps}, "
             f"world_size={self.parallel_state.world_size}"
@@ -418,20 +854,29 @@ class OPDTTTTrainer:
                     logger.info(f"数据加载器在步骤 {global_step} 完成")
                     break
 
-                # 计算批次统计
-                length_in_batch = torch.tensor(0, dtype=torch.int32, device=self.device)
-                for micro_batch in micro_batches:
-                    length_in_batch += torch.sum(micro_batch["labels"] != -100)
-                length_in_batch = all_reduce(
-                    length_in_batch, op="sum", group=self.parallel_state.fsdp_group
-                )
+                # 计算批次统计（OPD模式不需要）
+                if not enable_opd:
+                    length_in_batch = torch.tensor(0, dtype=torch.int32, device=self.device)
+                    for micro_batch in micro_batches:
+                        length_in_batch += torch.sum(micro_batch["labels"] != -100)
+                    length_in_batch = all_reduce(
+                        length_in_batch, op="sum", group=self.parallel_state.fsdp_group
+                    )
 
                 # 处理小批量
                 total_loss = 0.0
-                for micro_batch in micro_batches:
-                    loss = self.train_step(micro_batch, length_in_batch)
-                    total_loss += loss
-                    del micro_batch
+                if enable_opd:
+                    # OPD模式：从学生采样并使用重要性采样
+                    for micro_batch in micro_batches:
+                        loss = self.train_step_opd(prompts_batch=micro_batch)
+                        total_loss += loss
+                        del micro_batch
+                else:
+                    # 标准模式：使用训练数据的teacher-student训练
+                    for micro_batch in micro_batches:
+                        loss = self.train_step(micro_batch, length_in_batch)
+                        total_loss += loss
+                        del micro_batch
 
                 # 梯度裁剪和优化
                 grad_norm = veomni_clip_grad_norm(
@@ -550,7 +995,9 @@ def build_teacher_model(
     Returns:
         教师模型（如果路径有效），否则返回 None
     """
-    if not teacher_path:
+    # 处理空字符串和字面量 "" 的情况
+    teacher_path = teacher_path.strip() if teacher_path else ""
+    if teacher_path in ['""', "''", '']:
         return None
 
     logger.info(f"加载教师模型: {teacher_path}")
@@ -706,10 +1153,16 @@ def main():
         config.teacher_embeddings_for_init = teacher_embeddings_for_init
 
     # 自动从教师模型配置读取 teacher_hidden_size
-    if args.opdttt.teacher_model_path:
+    # 处理空字符串和字面量 "" 的情况
+    teacher_path = args.opdttt.teacher_model_path.strip() if args.opdttt.teacher_model_path else ""
+    # 移除可能的引号包裹
+    if teacher_path in ['""', "''"]:
+        teacher_path = ""
+
+    if teacher_path:
         from transformers import AutoConfig as AutoConfigTeacher
         try:
-            teacher_config = AutoConfigTeacher.from_pretrained(args.opdttt.teacher_model_path)
+            teacher_config = AutoConfigTeacher.from_pretrained(teacher_path)
             config.teacher_hidden_size = teacher_config.hidden_size
             logger.info_rank0(f"从教师配置读取 teacher_hidden_size: {config.teacher_hidden_size}")
         except Exception as e:
@@ -754,10 +1207,11 @@ def main():
         student_model = student_model.to(device)
 
     # 并行化模型
+    # 注意：当从配置初始化时（has_weights=False），weights_path 应为 None
     student_model = build_parallelize_model(
         student_model,
         init_device=args.train.init_device,
-        weights_path=args.model.model_path,
+        weights_path=args.model.model_path if has_weights else None,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -770,18 +1224,23 @@ def main():
 
     helper.print_device_mem_info("构建学生模型后的显存使用")
 
-    # 构建教师模型（仅在 rank 0）
+    # 构建教师模型（仅在 rank 0 且有教师路径时）
     teacher_model = None
-    if args.opdttt.teacher_model_path and args.train.global_rank == 0:
+    # 检查 teacher_model_path 是否非空且不是仅包含空格
+    teacher_path = args.opdttt.teacher_model_path.strip() if args.opdttt.teacher_model_path else ""
+    if teacher_path and args.train.global_rank == 0:
         # 使用设备字符串而不是模块，避免 pickle 错误
         device_str = f"{get_device_type()}:{args.train.local_rank}"
         teacher_model = build_teacher_model(
-            args.opdttt.teacher_model_path,
+            teacher_path,
             device_str,  # 使用设备字符串
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
             tokenizer=tokenizer,  # 传递统一 tokenizer 用于检查 vocab_size 一致性
         )
+        logger.info_rank0(f"教师模型已加载: {teacher_path}")
+    else:
+        logger.info_rank0("未配置教师模型，使用无教师模式训练")
 
     # 构建优化器和调度器
     optimizer = build_optimizer(

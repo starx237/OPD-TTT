@@ -181,4 +181,5 @@ data/output/
 # Documents
 
 documents/
+CLAUDE.md
 export_chat_history.py
