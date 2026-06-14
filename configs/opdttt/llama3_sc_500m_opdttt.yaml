@@ -9,7 +9,7 @@ model:
   tokenizer_path: model_assets/tokenizer
 
   # 词汇表大小（与 tokenizer 一致）
-  vocab_size: 151646
+  vocab_size: 151665
 
   # OPD-TTT 基础设置
   foundation:
@@ -46,7 +46,7 @@ data:
   data_dir: data
 
   # 训练数据路径（PILES 长文本数据）
-  train_path: piles_packed_32768.jsonl
+  train_path: data/piles_packed_32768.jsonl
 
   # 总训练 Token 数量（20B）
   train_size: 20000000000
@@ -171,12 +171,6 @@ opdttt:
 
   # 启用教师输出缓存
   enable_teacher_cache: true
-
-  # 损失权重（可覆盖 foundation 中的设置）
-  lambda_kl: 0.1
-  lambda_lm: 1.0
-  lambda_ntp: 1.0
-  lambda_align_rep: 0.5
 
   # TTT/OPD-TTT 参数
   ttt_lr: 0.3

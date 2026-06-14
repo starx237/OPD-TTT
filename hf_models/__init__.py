@@ -14,4 +14,4 @@
 
 from . import hf_llama   # noqa — registers TTT-Llama with AutoModel
 from . import hf_qwen3   # noqa — registers TTT-Qwen3 with AutoModel
-from . import hf_lact    # noqa — registers LaCT with AutoModel
+# from . import hf_lact    # noqa — registers LaCT with AutoModel (暂时禁用)

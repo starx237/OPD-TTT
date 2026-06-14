@@ -161,8 +161,8 @@ vscode.sh
 results/ruler
 Qwen3-*
 
-# VeOmni 框架源码（pip install -e 安装，外部依赖不追踪）
-VeOmni/
+# VeOmni 框架源码，做了兼容性补丁
+# VeOmni/
 
 # =============================================================================
 # Machine-specific files (never commit)

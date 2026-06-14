@@ -1,0 +1,79 @@
+# OPD-TTT 500M 冒烟测试配置
+# 仅用于验证训练流程能正常工作
+
+# ========== 模型配置 ==========
+model:
+  model_path: model_assets/llama_500m_config
+  tokenizer_path: model_assets/tokenizer
+  vocab_size: 151665
+
+  foundation:
+    opdttt_mode: true
+    opdttt_layers: [0, 6, 12, 18]
+    ttt_proj: true
+    ttt_lr: 0.3
+    ttt_chunk: 1024  # 较小的分块，适合测试
+    ttt_target: input_embed
+
+    # 教师模型配置（用于投影矩阵初始化）
+    teacher_hidden_size: 3584  # Qwen2.5-7B 的 hidden_size
+
+    # 损失权重
+    lambda_ntp: 1.0
+    lambda_align_rep: 0.5  # 现在可以启用教师对齐
+    lambda_kl: 0.1  # 重新启用，vocab_size已修复
+    lambda_lm: 1.0
+
+# ========== 数据配置 ==========
+data:
+  data_dir: data
+  train_path: data/test_piles_smoketest.jsonl  # 使用完整路径
+  train_size: 50000  # 约 1 步的 token 数
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 2048  # 减少序列长度以节省内存
+  text_keys: content_split
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/smoke_test_opdttt
+  data_parallel_mode: ddp  # 使用 DDP 而不是 FSDP2，更简单
+  ulysses_parallel_size: 1
+  global_batch_size: 2  # 小批次，2 个 GPU 各 1
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: false  # 关闭 wandb
+  max_steps: 1  # 只训练 1 步
+  optimizer: adamw
+  lr: 5.0e-4
+  lr_warmup_ratio: 0.1
+  lr_decay_style: constant  # 不衰减
+  lr_min: 5.0e-4
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: false
+  enable_full_shard: false  # 关闭 FSDP2
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: cuda  # 使用 cuda 而不是 meta
+  ckpt_manager: dcp
+  save_checkpoint_path: data/output/smoke_test_opdttt/checkpoints
+  save_steps: 1  # 保存 1 次
+  save_hf_weights: true
+  empty_cache_steps: 100
+  seed: 42
+
+# ========== OPD-TTT 特定参数 ==========
+opdttt:
+  teacher_model_path: "model_assets/teacher_qwen2.5_7b"  # 使用教师模型
+  enable_teacher_cache: true
+  ttt_lr: 0.3
+  ttt_chunk: 1024
+  ttt_proj: true
+  opdttt_layers: [0, 6, 12, 18]
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"

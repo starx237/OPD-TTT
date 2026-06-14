@@ -111,6 +111,10 @@ class OPDTTTMLP(nn.Module):
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
 
+        # 获取教师模型的hidden_size，默认与学生模型相同
+        # 这允许不同大小的教师-学生模型对（如7B教师 -> 500M学生）
+        self.teacher_hidden_size = getattr(config, "teacher_hidden_size", self.hidden_size)
+
         # 标准的 SwiGLU MLP 结构
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
@@ -138,13 +142,15 @@ class OPDTTTMLP(nn.Module):
                 self.ttt_proj = None
 
             # 教师投影矩阵：将教师的嵌入投影到 MLP 输出空间
+            # 输入维度 = teacher_hidden_size (教师模型的hidden_size)
+            # 输出维度 = student_hidden_size (学生模型的hidden_size)
             # 支持三种初始化方式：'random', 'pca', 'pca_tied'
             # - 'random': 随机初始化（默认）
             # - 'pca': 使用教师嵌入的 PCA 初始化（需要提供 teacher_embeddings_for_init）
             # - 'pca_tied': 所有层共享同一个 PCA 初始化的投影矩阵
             self.teacher_proj_init = getattr(config, "teacher_proj_init", "random")
             self.teacher_proj = nn.Linear(
-                self.hidden_size, self.hidden_size, bias=False
+                self.teacher_hidden_size, self.hidden_size, bias=False
             )
 
             # 如果配置中提供了用于 PCA 初始化的教师嵌入，进行 PCA 初始化
@@ -253,28 +259,40 @@ class OPDTTTMLP(nn.Module):
         # 关键：所有分块的增量可以并行计算（因为 NTP 目标只依赖输入，不依赖当前权重）
 
         # 1. NTP 对齐分量：使 MLP 输出能够预测下一Token的表示
+        # 注意：einsum 在 BFloat16 下可能不稳定，转换为 float32 进行计算
+        dtype = h_padded.dtype
+        h_float = h_padded[:, :-1].float() if dtype == torch.bfloat16 else h_padded[:, :-1]
+        ntp_target_float = ntp_target[:, :-1].float() if dtype == torch.bfloat16 else ntp_target[:, :-1]
+
         if self.ttt_proj is not None:
+            ttt_proj_weight = self.ttt_proj.weight.float() if self.ttt_proj.weight.dtype == torch.bfloat16 else self.ttt_proj.weight
             ntp_proj = torch.einsum(
                 "b t c h, b t c d, d e -> b t e h",
-                h_padded[:, :-1],           # 当前分块的 MLP 输入（除了最后一个分块）
-                ntp_target[:, :-1],        # NTP 目标（下一Token表示）
-                self.ttt_proj.weight,       # NTP 投影矩阵
+                h_float,           # 当前分块的 MLP 输入（除了最后一个分块）
+                ntp_target_float,        # NTP 目标（下一Token表示）
+                ttt_proj_weight,       # NTP 投影矩阵
             )
         else:
             ntp_proj = torch.einsum(
                 "b t c h, b t c d -> b t d h",
-                h_padded[:, :-1],
-                ntp_target[:, :-1],
+                h_float,
+                ntp_target_float,
             )
+        # 转换回原始 dtype
+        ntp_proj = ntp_proj.to(dtype)
 
         # 2. 教师表示对齐分量：使 MLP 输出与教师表示对齐
         if teacher_repr is not None:
+            teacher_repr_float = teacher_repr[:, :-1].float() if teacher_repr.dtype == torch.bfloat16 else teacher_repr[:, :-1]
+            teacher_proj_weight = self.teacher_proj.weight.float() if self.teacher_proj.weight.dtype == torch.bfloat16 else self.teacher_proj.weight
             teacher_align = torch.einsum(
-                "b t c h, b t c d, d e -> b t e h",
-                h_padded[:, :-1],           # MLP 输入
-                teacher_repr[:, :-1],       # 教师表示目标
-                self.teacher_proj.weight,   # 教师投影矩阵
+                "b t c h, b t c d, e d -> b t e h",
+                h_float,           # MLP 输入 [b, t, c, h=hidden_size]
+                teacher_repr_float,       # 教师表示目标 [b, t, c, d=teacher_hidden_size]
+                teacher_proj_weight,   # 教师投影矩阵 [e=hidden_size, d=teacher_hidden_size]
             )
+            # 转换回原始 dtype
+            teacher_align = teacher_align.to(dtype)
         else:
             # 如果没有提供教师，使用零向量
             teacher_align = torch.zeros_like(ntp_proj)
@@ -323,12 +341,31 @@ class OPDTTTMLP(nn.Module):
         down_proj = torch.einsum("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
         output = rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
 
+        # 将目标从4维 (b, t, c, d) reshape成3维 (b, t*c, d) 以匹配output的形状
+        ntp_target_3d = rearrange(ntp_target, "b t c d -> b (t c) d")
+
         # 计算表示对齐损失（用于监控）
         loss_dict = {
-            "ntp_loss": self._compute_repr_loss(output[:, :-1], ntp_target[:, 1:]),
+            "ntp_loss": self._compute_repr_loss(output[:, :-1], ntp_target_3d[:, 1:]),
         }
         if teacher_repr is not None:
-            loss_dict["align_rep_loss"] = self._compute_repr_loss(output[:, :-1], teacher_repr[:, 1:])
+            teacher_repr_3d = rearrange(teacher_repr, "b t c d -> b (t c) d")
+            # 将教师表示投影到学生模型的 hidden_size
+            # teacher_repr_3d: [batch, seq_len, teacher_hidden_size]
+            # teacher_proj.weight: [student_hidden_size, teacher_hidden_size]
+            # 需要转置 teacher_proj.weight 为 [teacher_hidden_size, student_hidden_size] 进行投影
+            # 注意：einsum 在 BFloat16 下可能不稳定，转换为 float32 进行计算
+            dtype = teacher_repr_3d.dtype
+            teacher_repr_3d_float = teacher_repr_3d.float() if dtype == torch.bfloat16 else teacher_repr_3d
+            teacher_proj_weight = self.teacher_proj.weight.float() if self.teacher_proj.weight.dtype == torch.bfloat16 else self.teacher_proj.weight
+            teacher_repr_projected = torch.einsum(
+                "b t d, e d -> b t e",
+                teacher_repr_3d_float,
+                teacher_proj_weight  # [student_hidden_size, teacher_hidden_size]
+            )
+            # 转换回原始 dtype
+            teacher_repr_projected = teacher_repr_projected.to(dtype)
+            loss_dict["align_rep_loss"] = self._compute_repr_loss(output[:, :-1], teacher_repr_projected[:, 1:])
 
         return output, loss_dict
 
@@ -580,12 +617,12 @@ class TeacherCache:
 
 
 def compute_teacher_repr_targets(
-    teacher_logits: torch.Tensor,
-    teacher_embeddings: torch.Tensor,
+    teacher_logits: Optional[torch.Tensor],
+    teacher_embeddings: Optional[torch.Tensor],
     layer_idx: int,
     hidden_size: int,
     chunk_size: int = 4096,
-) -> torch.Tensor:
+) -> Optional[torch.Tensor]:
     """
     计算特定层的教师表示目标
 
@@ -593,18 +630,36 @@ def compute_teacher_repr_targets(
     实现表示级别的对齐。
 
     Args:
-        teacher_logits: 教师模型 logits [batch, seq_len, vocab_size]
-        teacher_embeddings: 教师模型嵌入 [batch, seq_len, hidden_size]
+        teacher_logits: 教师模型 logits [batch, seq_len, vocab_size]（可选）
+        teacher_embeddings: 教师模型嵌入 [batch, seq_len, hidden_size]（可选）
         layer_idx: 当前层的索引
         hidden_size: 模型隐藏大小
         chunk_size: 处理的分块大小
 
     Returns:
-        教师表示目标 [batch, seq_len, hidden_size]
+        教师表示目标 [batch, seq_len, hidden_size]，如果输入都为None则返回None
     """
+    # 如果都没有提供，返回 None
+    if teacher_logits is None and teacher_embeddings is None:
+        return None
+
+    # 如果只提供了 embeddings，直接使用
+    if teacher_logits is None and teacher_embeddings is not None:
+        # 填充到分块大小（如果需要）
+        seq_len = teacher_embeddings.shape[1]
+        if seq_len % chunk_size != 0:
+            pad_len = chunk_size - (seq_len % chunk_size)
+            padding = torch.zeros(
+                teacher_embeddings.shape[0], pad_len, teacher_embeddings.shape[2],
+                device=teacher_embeddings.device, dtype=teacher_embeddings.dtype
+            )
+            teacher_embeddings = torch.cat([teacher_embeddings, padding], dim=1)
+        return teacher_embeddings
+
     # 方法：使用教师嵌入的 logits 加权版本
     # 这创建了一个捕捉教师预测分布的表示
-    teacher_probs = F.softmax(teacher_logits, dim=-1)
+    if teacher_logits is not None:
+        teacher_probs = F.softmax(teacher_logits, dim=-1)
 
     # 为效率起见，直接使用嵌入
     # 在完整实现中，每层应该有一个投影矩阵

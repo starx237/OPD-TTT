@@ -225,7 +225,9 @@ class OPDTTTTrainer:
         self.lr_scheduler = lr_scheduler
         self.checkpointer = checkpointer
 
-        self.device = get_torch_device()
+        # 使用设备对象而不是模块，避免 tensor() 创建时的错误
+        device_str = f"{get_device_type()}:{args.train.local_rank}"
+        self.device = torch.device(device_str)
         self.parallel_state = get_parallel_state()
 
         # 设置激活卸载上下文
@@ -235,17 +237,9 @@ class OPDTTTTrainer:
             args.train.activation_gpu_limit,
         )
 
-        # 为 DDP 模式添加 autocast
-        if args.train.data_parallel_mode == "ddp" and args.train.enable_mixed_precision:
-            from contextlib import contextmanager
-
-            @contextmanager
-            def autocast_context_wrapper(inner_context):
-                with inner_context:
-                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                        yield
-
-            self.model_fwd_context = autocast_context_wrapper(self.model_fwd_context)
+        # 为 DDP 模式添加 autocast 标志
+        self.use_ddp_autocast = args.train.data_parallel_mode == "ddp" and args.train.enable_mixed_precision
+        if self.use_ddp_autocast:
             logger.info("为 DDP 模式启用 autocast")
 
         # 教师缓存
@@ -335,15 +329,33 @@ class OPDTTTTrainer:
             )
 
         # 学生前向传播（带教师指导）
-        with self.model_fwd_context:
+        # 当 lambda_align_rep 为 0 时，不传递教师表示以避免维度不匹配
+        # 当 lambda_kl 为 0 时，不传递教师 logits 以避免 vocab_size 不匹配
+        use_teacher_rep = self.args.opdttt.lambda_align_rep > 0
+        use_teacher_logits = self.args.opdttt.lambda_kl > 0
+
+        # 使用 autocast 上下文（如果启用）
+        if self.use_ddp_autocast:
+            with self.model_fwd_context:
+                student_outputs = self.student_model(
+                    input_ids=micro_batch["input_ids"],
+                    attention_mask=micro_batch.get("attention_mask"),
+                    position_ids=micro_batch.get("position_ids"),
+                    labels=micro_batch["labels"],
+                    teacher_logits=teacher_outputs["logits"] if teacher_outputs and use_teacher_logits else None,
+                    teacher_hidden_states=teacher_outputs["hidden_states"] if teacher_outputs and use_teacher_rep else None,
+                    teacher_embeddings=teacher_outputs["embeddings"] if teacher_outputs and use_teacher_rep else None,
+                    use_cache=False,
+                )
+        else:
             student_outputs = self.student_model(
                 input_ids=micro_batch["input_ids"],
                 attention_mask=micro_batch.get("attention_mask"),
                 position_ids=micro_batch.get("position_ids"),
                 labels=micro_batch["labels"],
-                teacher_logits=teacher_outputs["logits"] if teacher_outputs else None,
-                teacher_hidden_states=teacher_outputs["hidden_states"] if teacher_outputs else None,
-                teacher_embeddings=teacher_outputs["embeddings"] if teacher_outputs else None,
+                teacher_logits=teacher_outputs["logits"] if teacher_outputs and use_teacher_logits else None,
+                teacher_hidden_states=teacher_outputs["hidden_states"] if teacher_outputs and use_teacher_rep else None,
+                teacher_embeddings=teacher_outputs["embeddings"] if teacher_outputs and use_teacher_rep else None,
                 use_cache=False,
             )
 
@@ -464,10 +476,7 @@ class OPDTTTTrainer:
                     self.args.train.save_steps
                     and global_step % self.args.train.save_steps == 0
                 ):
-                    self._save_checkpoint(global_step, last_ckpt_path)
-                    last_ckpt_path = os.path.join(
-                        self.args.train.save_checkpoint_path, f"global_step_{global_step}"
-                    )
+                    last_ckpt_path = self._save_checkpoint(global_step, last_ckpt_path)
 
             start_step = 0
 
@@ -493,12 +502,18 @@ class OPDTTTTrainer:
 
         self.checkpointer.save(save_path, state, global_steps=global_step)
         dist.barrier()
-        logger.info(f"检查点已保存: {save_path}")
+
+        # DCP checkpointer 创建嵌套目录结构：save_path/global_step_X
+        # 更新 last_ckpt_path 为实际保存的检查点路径
+        actual_ckpt_path = os.path.join(save_path, f"global_step_{global_step}")
+        logger.info(f"检查点已保存: {actual_ckpt_path}")
 
         # 轮转旧检查点
         if last_ckpt_path is not None and os.path.isdir(last_ckpt_path):
             shutil.rmtree(last_ckpt_path, ignore_errors=True)
             logger.info(f"删除旧检查点: {last_ckpt_path}")
+
+        return actual_ckpt_path
 
     def _save_hf_weights(self, global_step: int, last_ckpt_path: Optional[str]):
         """保存 HuggingFace 格式权重"""
@@ -545,8 +560,10 @@ def build_teacher_model(
         teacher_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
-        device_map={"": device},
+        # 不使用 device_map 以避免依赖 accelerate，手动移动到设备
     )
+    # 手动移动模型到指定设备
+    teacher_model = teacher_model.to(device)
     teacher_model.eval()
 
     # 检查 tokenizer vocab_size 一致性
@@ -609,20 +626,19 @@ def main():
     )
 
     # 构建分词器
-    logger_info_rank0("构建分词器")
+    logger.info_rank0("构建分词器")
     tokenizer = build_tokenizer(args.model.tokenizer_path)
 
     # 准备数据
-    logger_info_rank0("准备数据")
+    logger.info_rank0("准备数据")
     transform = partial(
-        _data_transform.process_pretrain_example,
+        _data_transform.process_plaintext_example,
         tokenizer=tokenizer,
         max_seq_len=args.data.max_seq_len,
         text_keys=args.data.text_keys,
     )
 
     train_dataset = build_dataset(
-        dataset_name=args.data.dataset_name,
         transform=transform,
         dataloader_batch_size=args.train.dataloader_batch_size,
         seed=args.train.seed,
@@ -643,6 +659,7 @@ def main():
     }
 
     train_dataloader = build_dataloader(
+        dataloader_type=args.data.dataloader.type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
@@ -650,9 +667,7 @@ def main():
         seed=args.train.seed,
         max_seq_len=args.data.max_seq_len,
         train_steps=train_steps,
-        rmpad=getattr(args.train, "rmpad", True),
-        rmpad_with_pos_ids=getattr(args.train, "rmpad_with_pos_ids", False),
-        dyn_bsz_margin=getattr(args.train, "dyn_bsz_margin", 0),
+        # 注意: native dataloader 不支持 rmpad 和 rmpad_with_pos_ids 参数
         dyn_bsz_buffer_size=getattr(args.data, "dyn_bsz_buffer_size", 500),
         dyn_bsz=getattr(args.train, "dyn_bsz", True),
         num_workers=args.data.num_workers,
@@ -661,7 +676,7 @@ def main():
     )
 
     # 构建学生模型
-    logger_info_rank0("构建学生模型")
+    logger.info_rank0("构建学生模型")
     from hf_models.hf_llama import OPDTTTForCausalLM
 
     config_path = args.model.config_path or args.model.model_path
@@ -686,16 +701,57 @@ def main():
     # 如果使用 PCA 初始化，加载教师嵌入
     teacher_embeddings_for_init = None
     if args.opdttt.teacher_proj_init == "pca" and args.opdttt.teacher_embeddings_path:
-        logger_info_rank0(f"加载教师嵌入用于 PCA 初始化：{args.opdttt.teacher_embeddings_path}")
+        logger.info_rank0(f"加载教师嵌入用于 PCA 初始化：{args.opdttt.teacher_embeddings_path}")
         teacher_embeddings_for_init = torch.load(args.opdttt.teacher_embeddings_path)
         config.teacher_embeddings_for_init = teacher_embeddings_for_init
 
-    student_model = OPDTTTForCausalLM.from_pretrained(
-        args.model.model_path,
-        config=config,
-        torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
-        attn_implementation=args.model.attn_implementation,
-    )
+    # 自动从教师模型配置读取 teacher_hidden_size
+    if args.opdttt.teacher_model_path:
+        from transformers import AutoConfig as AutoConfigTeacher
+        try:
+            teacher_config = AutoConfigTeacher.from_pretrained(args.opdttt.teacher_model_path)
+            config.teacher_hidden_size = teacher_config.hidden_size
+            logger.info_rank0(f"从教师配置读取 teacher_hidden_size: {config.teacher_hidden_size}")
+        except Exception as e:
+            logger.info_rank0(f"无法从教师配置读取 teacher_hidden_size: {e}，使用学生模型 hidden_size: {config.hidden_size}")
+            config.teacher_hidden_size = config.hidden_size
+    else:
+        # 如果没有教师模型，使用学生模型的 hidden_size
+        config.teacher_hidden_size = config.hidden_size
+        logger.info_rank0(f"没有配置教师模型，使用学生模型 hidden_size 作为 teacher_hidden_size: {config.teacher_hidden_size}")
+
+    # 检查是否存在模型权重，如果不存在则从配置初始化
+    model_path = args.model.model_path
+    has_weights = any(
+        f.endswith(('.safetensors', '.bin', '.pt'))
+        for f in os.listdir(model_path)
+        if os.path.isfile(os.path.join(model_path, f))
+    ) if os.path.isdir(model_path) else False
+
+    if has_weights:
+        logger.info_rank0(f"从预训练权重加载模型: {model_path}")
+        student_model = OPDTTTForCausalLM.from_pretrained(
+            model_path,
+            config=config,
+            torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
+            attn_implementation=args.model.attn_implementation,
+        )
+    else:
+        logger.info_rank0(f"从配置初始化模型 (训练从开始): {config_path}")
+        student_model = OPDTTTForCausalLM._from_config(
+            config,
+            torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
+            attn_implementation=args.model.attn_implementation,
+        )
+
+    # 对于从配置初始化的模型，需要先移动到目标设备
+    # build_parallelize_model 在 DDP 模式下不会自动移动设备
+    from veomni.distributed.parallel_state import get_parallel_state
+    parallel_state = get_parallel_state()
+    if not has_weights and parallel_state.dp_mode == "ddp":
+        device = torch.device(f"cuda:{parallel_state.local_rank}")
+        logger.info_rank0(f"将模型移动到设备: {device}")
+        student_model = student_model.to(device)
 
     # 并行化模型
     student_model = build_parallelize_model(
@@ -717,9 +773,11 @@ def main():
     # 构建教师模型（仅在 rank 0）
     teacher_model = None
     if args.opdttt.teacher_model_path and args.train.global_rank == 0:
+        # 使用设备字符串而不是模块，避免 pickle 错误
+        device_str = f"{get_device_type()}:{args.train.local_rank}"
         teacher_model = build_teacher_model(
             args.opdttt.teacher_model_path,
-            get_torch_device(),
+            device_str,  # 使用设备字符串
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
             tokenizer=tokenizer,  # 传递统一 tokenizer 用于检查 vocab_size 一致性

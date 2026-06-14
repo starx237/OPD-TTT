@@ -262,7 +262,8 @@ class OPDTTTModel(nn.Module):
             loss_dict: 损失字典
         """
         # 输入验证
-        if (input_ids is None) ^ (inputs_embeds is None):
+        # 两个都为 None 或两个都不为 None 时抛出错误
+        if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("必须且只能指定 input_ids 或 inputs_embeds 之一")
 
         # 获取输入嵌入
