@@ -1202,6 +1202,9 @@ def main():
             attn_implementation=args.model.attn_implementation,
         )
 
+    # 确认模型实际使用的 TTT 配置
+    logger.info_rank0(f"模型 TTT 配置确认: ttt_chunk={config.ttt_chunk}, opdttt_layers={config.opdttt_layers}, ttt_lr={config.ttt_lr}")
+
     # 对于从配置初始化的模型，需要先移动到目标设备
     # build_parallelize_model 在 DDP 模式下不会自动移动设备
     from veomni.distributed.parallel_state import get_parallel_state

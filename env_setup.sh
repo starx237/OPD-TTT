@@ -36,7 +36,7 @@ export NCCL_AVOID_RECORD_STREAMS=1
 export NCCL_NTHREADS=64
 export NCCL_P2P_LEVEL=NVL
 export NCCL_TIMEOUT=1800
-export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export TOKENIZERS_PARALLELISM=false
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 

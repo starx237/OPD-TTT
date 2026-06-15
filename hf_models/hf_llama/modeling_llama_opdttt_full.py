@@ -44,11 +44,12 @@ from .modeling_llama_opdttt import (
     OPDTTTLoss,
     compute_teacher_repr_targets,
 )
+from transformers.modeling_layers import GradientCheckpointingLayer
 
 logger = logging.get_logger(__name__)
 
 
-class OPDTTTDecoderLayer(nn.Module):
+class OPDTTTDecoderLayer(GradientCheckpointingLayer):
     """
     OPD-TTT 解码层
 
@@ -57,6 +58,7 @@ class OPDTTTDecoderLayer(nn.Module):
     1. 标准的注意力计算
     2. 教师引导的 MLP 前向传播
     3. 损失计算和返回
+    4. Gradient Checkpointing 支持
     """
 
     def __init__(self, config: LlamaConfig, layer_idx: int):
@@ -195,6 +197,9 @@ class OPDTTTModel(nn.Module):
         # 旋转位置嵌入
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
 
+        # Gradient checkpointing 设置
+        self.gradient_checkpointing = False
+
         # OPD-TTT 设置
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
         self.opdttt_mode = getattr(config, "opdttt_mode", False)
@@ -226,6 +231,46 @@ class OPDTTTModel(nn.Module):
         if self.ttt_target == "input_embed":
             return inputs_embeds
         return None
+
+    def compute_ce_loss(
+        self,
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        计算标准的交叉熵损失
+
+        Args:
+            logits: 模型输出 [batch, seq_len, vocab_size]
+            labels: 真实标签 [batch, seq_len]
+            attention_mask: 注意力掩码
+
+        Returns:
+            loss: 交叉熵损失
+        """
+        # 移位：预测下一个 token
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # 计算交叉熵损失
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        shift_logits_view = shift_logits.view(-1, self.config.vocab_size)
+        shift_labels_view = shift_labels.view(-1)
+
+        loss = loss_fct(shift_logits_view, shift_labels_view)
+
+        # 应用 attention mask
+        if attention_mask is not None:
+            # 移位 mask
+            shift_mask = attention_mask[..., 1:].contiguous()
+            shift_mask_view = shift_mask.view(-1)
+            loss = loss * shift_mask_view
+            loss = loss.sum() / shift_mask_view.sum()
+        else:
+            loss = loss.mean()
+
+        return loss
 
     @check_model_inputs()
     @auto_docstring
@@ -530,16 +575,21 @@ class OPDTTTForCausalLM(PreTrainedModel):
         loss = None
         loss_dict = {}
         if labels is not None:
-            loss, loss_dict = self.model.opdttt_loss(
-                student_logits=logits,
-                teacher_logits=teacher_logits,
-                labels=labels,
-                ntp_losses=ntp_losses,
-                attention_mask=attention_mask,
-            )
-            # 存储各个损失分量用于日志
-            loss_dict.update({k: v.detach() if isinstance(v, torch.Tensor) else v
-                             for k, v in loss_dict.items()})
+            if self.model.opdttt_mode:
+                loss, loss_dict = self.model.opdttt_loss(
+                    student_logits=logits,
+                    teacher_logits=teacher_logits,
+                    labels=labels,
+                    ntp_losses=ntp_losses,
+                    attention_mask=attention_mask,
+                )
+                # 存储各个损失分量用于日志
+                loss_dict.update({k: v.detach() if isinstance(v, torch.Tensor) else v
+                                 for k, v in loss_dict.items()})
+            else:
+                # 标准的交叉熵损失
+                loss = self.model.compute_ce_loss(logits, labels, attention_mask)
+                loss_dict = {"lm_loss": loss.detach() if loss is not None else None}
 
         return CausalLMOutputWithPast(
             loss=loss,

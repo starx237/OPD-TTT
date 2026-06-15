@@ -296,27 +296,35 @@ def parse_args(root_class: Type[T]) -> T:
     """
     Parses arguments from both a YAML configuration file and Command Line Arguments.
     CLI arguments override YAML configurations.
+
+    Supports both positional config_file and --config flag for compatibility.
+    --config takes precedence over positional config_file.
     """
     parser = argparse.ArgumentParser(allow_abbrev=False)
-    parser.add_argument("config_file", nargs="?", help="Path to YAML config file")
+    # 兼容性支持：同时支持位置参数和 --config 标志
+    parser.add_argument("config_file", nargs="?", help="Path to YAML config file (positional)")
+    parser.add_argument("--config", dest="config_flag", help="Path to YAML config file (flag alias)")
     _add_arguments_recursive(parser, root_class)
     args = parser.parse_args()
+
+    # 兼容性处理：--config 优先于位置参数 config_file
+    config_path = getattr(args, "config_flag", None) or getattr(args, "config_file", None)
 
     final_config = {}
 
     if (
-        hasattr(args, "config_file")
-        and args.config_file
-        and (args.config_file.endswith(".yaml") or args.config_file.endswith(".yml"))
+        config_path
+        and (config_path.endswith(".yaml") or config_path.endswith(".yml"))
     ):
-        with open(args.config_file) as f:
+        with open(config_path) as f:
             yaml_config = yaml.safe_load(f)
             if yaml_config:
                 final_config = yaml_config
 
     cli_config = {}
     for key, value in vars(args).items():
-        if key == "config_file":
+        # 跳过配置文件参数（位置参数和标志参数）
+        if key in ("config_file", "config_flag"):
             continue
 
         keys = key.split(".")

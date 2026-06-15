@@ -11,7 +11,37 @@
 
 ## 已添加的兼容性补丁
 
-### 1. 配置文件扁平结构支持 (`parser.py`)
+### 1. --config 标志支持 (`parser.py`)
+
+**位置**: `veomni/arguments/parser.py`
+
+**问题**: 原始实现只支持位置参数传递配置文件，许多用户习惯使用 `--config` 标志。
+
+**解决方案**: 添加可选的 `--config` 标志，同时保持位置参数兼容性：
+
+```python
+# 兼容性支持：同时支持位置参数和 --config 标志
+parser.add_argument("config_file", nargs="?", help="Path to YAML config file (positional)")
+parser.add_argument("--config", dest="config_flag", help="Path to YAML config file (flag alias)")
+
+# --config 优先于位置参数
+config_path = getattr(args, "config_flag", None) or getattr(args, "config_file", None)
+```
+
+**优先级**: `--config` 标志 > 位置参数 `config_file`
+
+**支持的用法**:
+```bash
+# 方式1：位置参数（原有方式）
+python train.py configs/config.yaml
+
+# 方式2：--config 标志（新增）
+python train.py --config configs/config.yaml
+```
+
+---
+
+### 2. 配置文件扁平结构支持 (`parser.py`)
 
 **位置**: `veomni/arguments/parser.py`
 
@@ -28,7 +58,7 @@
 - `ulysses_parallel_size` → `accelerator.ulysses_size`
 - `enable_mixed_precision` → `accelerator.fsdf_config.mixed_precision.enable`
 
-### 2. PyTorch 2.5.x DCP API 兼容性 (`dcp_checkpointer.py`)
+### 3. PyTorch 2.5.x DCP API 兼容性 (`dcp_checkpointer.py`)
 
 **位置**: `veomni/checkpoint/dcp_checkpointer.py`
 
@@ -54,7 +84,7 @@ load(
 )
 ```
 
-### 3. FSDP2 + Gradient Checkpointing DTensor 兼容性
+### 4. FSDP2 + Gradient Checkpointing DTensor 兼容性
 
 **问题**: 在 FSDP2 下使用 gradient checkpointing 时，重计算阶段的输入是普通 Tensor 而参数是 DTensor，导致 `RuntimeError: aten.mul.Tensor: got mixed torch.Tensor and DTensor`。
 
@@ -62,7 +92,7 @@ load(
 
 **长期解决方案**: 需要修改 gradient checkpointing 实现以正确处理 DTensor。
 
-### 4. HuggingFace Backend 3-Tuple Loss 返回兼容性 (`ops/__init__.py`)
+### 5. HuggingFace Backend 3-Tuple Loss 返回兼容性 (`ops/__init__.py`)
 
 **位置**: `veomni/ops/__init__.py`
 
@@ -94,7 +124,7 @@ def _patch_hf_model_for_veomni_loss():
     LlamaForCausalLM.forward = patched_forward
 ```
 
-### 5. FSDP2 logits.float() OOM 修复 (`cross_entropy/__init__.py`)
+### 6. FSDP2 logits.float() OOM 修复 (`cross_entropy/__init__.py`)
 
 **位置**: `veomni/ops/kernels/cross_entropy/__init__.py`
 
@@ -115,7 +145,7 @@ if logits is not None and cross_entropy_fn.__name__ != "eager_cross_entropy":
         logits = logits.float()
 ```
 
-### 6. HuggingFace Backend Loss 返回格式兼容性 (`cross_entropy/__init__.py`)
+### 7. HuggingFace Backend Loss 返回格式兼容性 (`cross_entropy/__init__.py`)
 
 **位置**: `veomni/ops/kernels/cross_entropy/__init__.py`
 
@@ -134,7 +164,7 @@ if hidden_states is None and weights is None:
 return loss, logits, None
 ```
 
-### 7. Liger Kernel Fallback 兼容性 (`liger.py`)
+### 8. Liger Kernel Fallback 兼容性 (`liger.py`)
 
 **位置**: `veomni/ops/kernels/cross_entropy/liger.py`
 
