@@ -966,6 +966,11 @@ class OPDTTTTrainer:
             self.args.train.save_checkpoint_path, f"global_step_{global_step}", "hf_ckpt"
         )
 
+        # 在保存HuggingFace权重前清空缓存，避免OOM
+        # 因为ckpt_to_state_dict会聚合所有分片参数到一起
+        helper.empty_cache()
+        synchronize()
+
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=last_ckpt_path,
             ckpt_manager=self.args.train.ckpt_manager,
