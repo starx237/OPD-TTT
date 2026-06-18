@@ -168,6 +168,11 @@ class OPDTTTMLP(nn.Module):
             # 快速权重学习率
             self.ttt_lr = getattr(config, "ttt_lr", 0.3)
 
+            # 快速权重更新的 Frobenius 范数裁剪
+            # 用于防止快速权重漂移和爆炸
+            # 根据论文 3.2.6 节，max_norm 设置为 1e-5
+            self.ttt_max_norm = getattr(config, "ttt_max_norm", 1e-5)
+
             # 损失权重
             self.lambda_ntp = getattr(config, "lambda_ntp", 1.0)
             self.lambda_align_rep = getattr(config, "lambda_align_rep", 0.5)
@@ -330,6 +335,18 @@ class OPDTTTMLP(nn.Module):
         else:
             # 没有教师对齐的情况（lambda_align_rep=0 或没有教师）
             weighted_update = ntp_proj * self.lambda_ntp * self.ttt_lr
+
+        # Frobenius 范数裁剪（根据论文 3.2.6 节）
+        # 防止快速权重漂移和爆炸，保持训练稳定性
+        # 裁剪公式：ΔW ← clip(ΔW, max_norm)
+        if self.ttt_max_norm > 0:
+            # 计算每个分块更新的 Frobenius 范数
+            # weighted_update: [batch, chunks-1, hidden_size, intermediate_size]
+            # 计算范数并裁剪
+            weighted_update_norm = torch.norm(weighted_update, p='fro', dim=[2, 3], keepdim=True)  # [batch, chunks-1, 1, 1]
+            clip_coef = self.ttt_max_norm / (weighted_update_norm + 1e-8)
+            clip_coef = torch.clamp(clip_coef, max=1.0)  # 只裁剪超过 max_norm 的情况
+            weighted_update = weighted_update * clip_coef
 
         d_down_proj = torch.cat(
             [

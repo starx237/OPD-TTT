@@ -18,7 +18,7 @@ OPD-TTT 完整模型实现
 from typing import Optional, Tuple, Union, Dict, Any, List
 import torch
 import torch.nn as nn
-from transformers import PreTrainedModel
+from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_rope_utils import dynamic_rope_update
@@ -435,7 +435,7 @@ class OPDTTTModel(nn.Module):
         return teacher_repr
 
 
-class OPDTTTForCausalLM(PreTrainedModel):
+class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
     """
     OPD-TTT 因果语言模型
 
@@ -443,7 +443,7 @@ class OPDTTTForCausalLM(PreTrainedModel):
     1. 教师模型指导的训练
     2. 四层损失函数
     3. 分布式训练（FSDP2）
-    4. 标准的 HuggingFace 接口
+    4. 标准的 HuggingFace 接口和生成方法
     """
 
     config_class = LlamaConfig
@@ -478,6 +478,35 @@ class OPDTTTForCausalLM(PreTrainedModel):
         self.lm_head.weight = self.model.embed_tokens.weight
 
         self.post_init()
+
+    def generate(self, **kwargs):
+        """
+        生成方法，支持标准的 HuggingFace generate 接口
+        
+        这个方法重写了 GenerationMixin.generate，确保在推理时不传递
+        教师相关的参数（teacher_logits, teacher_hidden_states, teacher_embeddings），
+        从而使 OPDTTTForCausalLM 兼容标准的 generate 方法。
+        
+        Args:
+            **kwargs: 所有标准的 generate 参数，如：
+                - input_ids: 输入 token IDs
+                - max_length: 最大生成长度
+                - do_sample: 是否采样
+                - temperature: 采样温度
+                - top_p: nucleus 采样参数
+                - etc.
+        
+        Returns:
+            生成的 token IDs
+        """
+        # 过滤掉教师相关参数，避免传递给 forward 方法
+        teacher_params = ['teacher_logits', 'teacher_hidden_states', 'teacher_embeddings']
+        for param in teacher_params:
+            if param in kwargs:
+                del kwargs[param]
+        
+        # 调用父类的 generate 方法
+        return super().generate(**kwargs)
 
     def get_input_embeddings(self):
         """获取输入嵌入层"""
@@ -594,7 +623,7 @@ class OPDTTTForCausalLM(PreTrainedModel):
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
-            past_key_values=self.model.layers[0].self_attn.past_key_values if use_cache else None,
+            past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=None,
         )

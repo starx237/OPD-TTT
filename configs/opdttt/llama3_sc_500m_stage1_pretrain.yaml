@@ -11,14 +11,14 @@ model:
 # ========== 数据配置 ==========
 data:
   data_dir: data
-  train_path: data/piles_packed_32768.jsonl
+  train_path: data/piles_packed_32768_shuffled.jsonl
   train_size: 20000000000     # 20B tokens
   dataloader_type: native
   datasets_type: iterable
   data_type: plaintext
   max_seq_len: 32768
   text_keys: content_split
-  drop_last: true
+  drop_last: false
 
 # ========== 训练配置 ==========
 train:
@@ -56,7 +56,7 @@ train:
     save_steps: 500
     save_hf_weights: true
     # 从checkpoint恢复训练时设置load_path
-    # load_path: data/output/500m_stage1_pretrain/checkpoints/global_step_500/global_step_500
+    # load_path: data/output/500m_stage1_pretrain/checkpoints/global_step_3000/global_step_3000
     load_path: ""
 
 # ========== OPD-TTT配置 ==========
@@ -69,6 +69,7 @@ opdttt:
   ttt_lr: 3
   ttt_chunk: 1024
   ttt_proj: true
+  ttt_max_norm: 1e-5       # Frobenius范数裁剪（根据论文3.2.6节）
 
   # 阶段1损失权重（无教师）
   lambda_ntp: 1.0            # NTP对齐（自监督）

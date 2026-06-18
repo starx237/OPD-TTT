@@ -81,6 +81,7 @@ opdttt:
   ttt_lr: 0.3
   ttt_chunk: 2048             # 较小chunk，因为序列较短
   ttt_proj: true
+  ttt_max_norm: 1e-5         # Frobenius范数裁剪（根据论文3.2.6节）
   opdttt_layers: [0, 6, 12, 18]
 
   # OPD采样参数
