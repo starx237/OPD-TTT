@@ -35,6 +35,8 @@ MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
 log.txt
+*.txt
+!requirements.txt
 
 # Unit test / coverage reports
 .cache
