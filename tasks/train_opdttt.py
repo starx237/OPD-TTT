@@ -183,10 +183,8 @@ class OPDTTTArguments:
         default=False,
         metadata={"help": "启用OPD on-policy采样（阶段2）"},
     )
-    opd_disable_ttt: bool = field(
-        default=True,
-        metadata={"help": "OPD采样时禁用TTT（保持采样和训练一致）"},
-    )
+    # 已移除 opd_disable_ttt 参数，因为禁用TTT会导致训练-推理不一致
+    # 采样和训练时都应该使用TTT以保持一致性
     opd_temperature: float = field(
         default=1.0,
         metadata={"help": "OPD采样温度"},
@@ -343,15 +341,16 @@ class OPDTTTTrainer:
         """
         从学生模型采样轨迹（OPD核心步骤）
 
-        注意：TTT快速权重会在采样过程中更新以适应prompt，
-        但这些更新不参与梯度计算（TTT作为inference时适应机制）
+        关键改进：使用 TTT cache 确保训练-推理一致性
+        - 采样时：使用 TTT cache，保存每个步骤的 TTT 状态
+        - 训练时：使用相同的 TTT cache 重新计算 logprobs
 
         Args:
             prompts: 包含prompt的批次数据
             num_trajectories: 每个prompt的采样轨迹数
 
         Returns:
-            采样轨迹列表，每个轨迹包含input_ids和采样logprobs
+            采样轨迹列表，每个轨迹包含input_ids、采样logprobs和TTT cache
         """
         self.student_model.eval()
         trajectories = []
@@ -372,10 +371,16 @@ class OPDTTTTrainer:
                 }
 
                 with torch.no_grad():
-                    # 使用学生模型的generate方法进行采样
-                    # 注意：这里TTT快速权重会更新以适应prompt
-                    # 但这些更新不参与梯度计算（TTT作为inference适应机制）
-                    # 在后续重新计算logprobs时，TTT会重新从头开始
+                    # 初始化 TTT cache
+                    from transformers.cache_utils import DynamicCache
+                    
+                    # 检查是否使用 TTT 模式
+                    if hasattr(self.student_model.config, 'opdttt_mode') and self.student_model.config.opdttt_mode:
+                        from inference_model.hf_llama3.modeling_llama import TTTDynamicCache
+                        ttt_cache = TTTDynamicCache(config=self.student_model.config)
+                    else:
+                        ttt_cache = DynamicCache(config=self.student_model.config)
+                    
                     sampled_ids = []
                     sampled_logprobs = []
                     current_input = single_prompt["input_ids"]
@@ -385,13 +390,14 @@ class OPDTTTTrainer:
                         self.args.data.max_seq_len,
                     )
 
-                    # 自回归采样
+                    # 自回归采样（使用 TTT cache）
                     for step in range(max_length - single_prompt["input_ids"].shape[1]):
-                        # 学生前向传播获取logits（TTT快速权重会更新）
+                        # 学生前向传播获取logits（使用 TTT cache）
                         outputs = self.student_model(
                             input_ids=current_input,
                             attention_mask=single_prompt["attention_mask"],
-                            use_cache=False,
+                            use_cache=True,  # 启用 cache 以使用 TTT 状态
+                            past_key_values=ttt_cache,
                         )
 
                         next_token_logits = outputs.logits[:, -1, :]  # [1, vocab_size]
@@ -442,6 +448,7 @@ class OPDTTTTrainer:
                     "input_ids": full_input_ids,
                     "sampled_logprobs": full_logprobs,  # 采样时的logprobs（no_grad）
                     "prompt_length": single_prompt["input_ids"].shape[1],
+                    "ttt_cache": ttt_cache,  # 保存 TTT cache 用于训练时恢复
                 })
 
         self.student_model.train()
@@ -612,22 +619,27 @@ class OPDTTTTrainer:
             return 0.0
 
         # 阶段2: 训练（保留梯度）
-        # 2a. 重新计算采样token的logprobs（一次前向传播，保留梯度！）
-        # 注意：这里使用一次前向传播计算整个序列的logprobs，避免重复自回归
-        # TTT更新可能会有微小差异，但避免了巨大的计算开销
+        # 使用与采样时相同的 TTT cache 重新计算采样token的logprobs
+        # 关键：使用相同的 TTT cache 确保训练-推理一致性
         for trajectory in trajectories:
             input_ids = trajectory["input_ids"]
             prompt_length = trajectory["prompt_length"]
+            ttt_cache = trajectory.get("ttt_cache")
 
             if input_ids.shape[1] <= prompt_length:
                 trajectory["student_logprobs_with_grad"] = None
                 continue
 
-            # 重新计算学生logprobs（一次前向传播，保留梯度！）
+            # 克隆 TTT cache 以避免修改采样的 cache
+            import copy
+            new_ttt_cache = copy.deepcopy(ttt_cache)
+
+            # 使用 TTT cache 重新计算学生logprobs（保留梯度！）
             outputs = self.student_model(
                 input_ids=input_ids,
                 attention_mask=torch.ones_like(input_ids),
-                use_cache=False,
+                use_cache=True,
+                past_key_values=new_ttt_cache,
             )
 
             # 获取采样位置的logits

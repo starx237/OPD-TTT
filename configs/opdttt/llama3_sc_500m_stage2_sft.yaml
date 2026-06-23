@@ -1,0 +1,90 @@
+# 阶段2：Off-policy 监督微调 (SFT)
+# 目标：使用高质量QA对数据进行标准监督微调
+# 这是预训练和OPD之间的可选桥梁阶段
+
+# ========== 模型配置 ==========
+model:
+  # 加载阶段1训练好的checkpoint
+  model_path: data/output/500m_stage1_pretrain/checkpoints/global_step_9500/hf_ckpt
+  tokenizer_path: model_assets/tokenizer
+  vocab_size: 151665
+
+  # OPD-TTT设置（SFT阶段保持TTT能力）
+  foundation:
+    opdttt_mode: true
+    opdttt_layers: [0, 6, 12, 18]
+    ttt_proj: true
+    ttt_lr: 0.3
+    ttt_chunk: 2048
+    ttt_target: input_embed
+
+    # SFT损失权重：标准监督学习
+    lambda_ntp: 1.0           # NTP对齐（保持TTT能力）
+    lambda_align_rep: 0.0     # 不使用教师表示对齐
+    lambda_kl: 0.0           # 不使用KL散度
+    lambda_lm: 1.0            # 标准语言建模损失
+
+# ========== 数据配置（SFT使用QA对数据）==========
+data:
+  data_dir: data
+  # 使用转换为预训练格式的SFT数据
+  # 原始格式：{"prompt": "...", "response": "..."}
+  # 转换后格式：{"text": "prompt\n\nresponse"}
+  train_path: data/opd_sft_train.jsonl
+  val_path: data/opd_sft_val.jsonl
+  train_size: 50000          # 50K QA对
+  val_size: 1000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 4096
+  # 转换后的数据使用 text 字段
+  text_keys: text
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/500m_stage2_sft
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 66
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: 500m-stage2-sft
+  max_steps: 3000             # SFT训练步数
+  optimizer: adamw
+  lr: 5.0e-5                  # SFT学习率
+  lr_warmup_ratio: 0.1
+  lr_decay_style: cosine
+  lr_min: 1.0e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: false
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  ckpt_manager: dcp
+  save_checkpoint_path: data/output/500m_stage2_sft/checkpoints
+  save_steps: 500
+  save_hf_weights: true
+  empty_cache_steps: 10
+  seed: 42
+
+# ========== SFT特定参数 ==========
+opdttt:
+  # SFT阶段不使用教师
+  teacher_model_path: ""
+  
+  # TTT参数（与阶段1保持一致）
+  ttt_lr: 0.3
+  ttt_chunk: 2048
+  ttt_proj: true
+  ttt_max_norm: 1e-5
+  opdttt_layers: [0, 6, 12, 18]
+  
+  # 不启用OPD采样
+  enable_opd_sampling: false
