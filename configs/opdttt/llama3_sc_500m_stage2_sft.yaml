@@ -47,7 +47,7 @@ train:
   output_dir: data/output/500m_stage2_sft
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
-  global_batch_size: 66
+  global_batch_size: 65
   micro_batch_size: 1
   rmpad: false
   use_wandb: true

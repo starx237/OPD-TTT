@@ -4,8 +4,8 @@
 
 # ========== 模型配置 ==========
 model:
-  # 加载阶段1训练好的checkpoint
-  model_path: data/output/500m_stage1_pretrain/checkpoints/global_step_9575/hf_ckpt
+  # 加载阶段2 SFT训练好的checkpoint
+  model_path: data/output/500m_stage2_sft/checkpoints/global_step_3000/hf_ckpt
   tokenizer_path: model_assets/tokenizer
   vocab_size: 151665
 
@@ -35,7 +35,7 @@ data:
   data_type: plaintext
   max_seq_len: 2048          # prompt长度，采样时会生成更长序列
   text_keys: prompt
-  drop_last: true
+  drop_last: false
 
 # ========== 训练配置 ==========
 train:
@@ -64,7 +64,7 @@ train:
   init_device: meta
   ckpt_manager: dcp
   save_checkpoint_path: data/output/500m_stage2_opd/checkpoints
-  save_steps: 100
+  save_steps: 500
   save_hf_weights: true
   empty_cache_steps: 10
   seed: 42
@@ -101,4 +101,4 @@ opdttt:
   # 阶段2可以使用PCA初始化（如果有阶段1提取的教师嵌入）
   teacher_proj_init: "random"
   teacher_embeddings_path: ""
-  weight_adaptation: "adaptive"    # OPD阶段使用自适应权重
+  weight_adaptation: "fixed"    # OPD阶段使用自适应权重
