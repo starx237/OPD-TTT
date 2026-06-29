@@ -4,6 +4,7 @@
 
 # ========== 模型配置 ==========
 model:
+  config_path: model_assets/llama_1b5_config
   # 加载阶段1训练好的checkpoint
   model_path: data/output/1b5_stage1_pretrain/checkpoints/global_step_14325/hf_ckpt
   tokenizer_path: model_assets/tokenizer

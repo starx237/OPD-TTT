@@ -163,6 +163,10 @@ class OPDTTTArguments:
         default=True,
         metadata={"help": "启用 NTP 目标投影"},
     )
+    ttt_max_norm: float = field(
+        default=1e-5,
+        metadata={"help": "快速权重更新的 Frobenius 范数裁剪"},
+    )
 
     # 自适应权重和 PCA 初始化参数
     weight_adaptation: str = field(
@@ -259,6 +263,7 @@ class OPDTTTTrainer:
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
         self.checkpointer = checkpointer
+        self.model_config = student_model.config if hasattr(student_model, 'config') else None
 
         # 使用设备对象而不是模块，避免 tensor() 创建时的错误
         device_str = f"{get_device_type()}:{args.train.local_rank}"
@@ -341,117 +346,138 @@ class OPDTTTTrainer:
         """
         从学生模型采样轨迹（OPD核心步骤）
 
-        关键改进：使用 TTT cache 确保训练-推理一致性
-        - 采样时：使用 TTT cache，保存每个步骤的 TTT 状态
-        - 训练时：使用相同的 TTT cache 重新计算 logprobs
-
-        Args:
-            prompts: 包含prompt的批次数据
-            num_trajectories: 每个prompt的采样轨迹数
-
-        Returns:
-            采样轨迹列表，每个轨迹包含input_ids、采样logprobs和TTT cache
+        每个micro_batch是一个单独的prompt（OPD模式禁用了动态打包）。
+        使用labels中的非IGNORE_INDEX部分来确定实际prompt长度。
         """
         self.student_model.eval()
         trajectories = []
 
-        prompt_ids = prompts["input_ids"].to(self.device)
-        attention_mask = prompts.get("attention_mask")
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
+        # 采样时禁用 FSDP2 reshard，避免每步 all_gather
+        _fsdp_modules = []
+        for module in self.student_model.modules():
+            if hasattr(module, 'set_reshard_after_forward'):
+                _fsdp_modules.append(module)
+        for module in _fsdp_modules:
+            module.set_reshard_after_forward(False)
 
-        batch_size = prompt_ids.shape[0]
+        input_ids = prompts["input_ids"].to(self.device)
+        labels = prompts.get("labels")
+        if labels is not None:
+            labels = labels.to(self.device)
+
+        # 通过 labels 确定 prompt 的实际长度
+        # labels中非IGNORE_INDEX的部分是真实token，之后是padding（IGNORE_INDEX）
+        if labels is not None:
+            actual_prompt_len = (labels[0] != -100).sum().item()
+        else:
+            actual_prompt_len = input_ids.shape[1]
+
+        # 截取真实prompt（去除padding）
+        prompt_ids = input_ids[:, :actual_prompt_len]
+
+        # 去除末尾的 EOS token（process_plaintext_example 添加的）
+        # 否则模型看到 EOS 后会立即停止采样
+        eos_token_id = self.tokenizer.eos_token_id
+        if prompt_ids.shape[1] > 1 and prompt_ids[0, -1].item() == eos_token_id:
+            prompt_ids = prompt_ids[:, :-1]
+            actual_prompt_len = prompt_ids.shape[1]
+
+
 
         for i in range(num_trajectories):
-            for b in range(batch_size):
-                # 单个prompt采样
-                single_prompt = {
-                    "input_ids": prompt_ids[b:b+1],
-                    "attention_mask": attention_mask[b:b+1] if attention_mask is not None else None,
-                }
+            with torch.no_grad():
+                from transformers.cache_utils import DynamicCache
 
-                with torch.no_grad():
-                    # 初始化 TTT cache
-                    from transformers.cache_utils import DynamicCache
-                    
-                    # 检查是否使用 TTT 模式
-                    if hasattr(self.student_model.config, 'opdttt_mode') and self.student_model.config.opdttt_mode:
-                        from inference_model.hf_llama3.modeling_llama import TTTDynamicCache
-                        ttt_cache = TTTDynamicCache(config=self.student_model.config)
+                kv_cache = DynamicCache()
+
+                sampled_ids = []
+                sampled_logprobs = []
+
+                max_length = min(
+                    actual_prompt_len + self.args.opdttt.opd_max_sample_length,
+                    self.args.data.max_seq_len,
+                )
+
+                max_new_tokens = max_length - actual_prompt_len
+                if max_new_tokens <= 0:
+                    trajectories.append({
+                        "input_ids": prompt_ids,
+                        "sampled_logprobs": None,
+                        "prompt_length": actual_prompt_len,
+                    })
+                    continue
+
+                step = 0
+                attn_mask = torch.ones(1, actual_prompt_len, dtype=torch.float32, device=self.device)
+                while len(sampled_ids) < max_new_tokens:
+                    if step == 0:
+                        input_to_model = prompt_ids
                     else:
-                        ttt_cache = DynamicCache(config=self.student_model.config)
-                    
-                    sampled_ids = []
-                    sampled_logprobs = []
-                    current_input = single_prompt["input_ids"]
-
-                    max_length = min(
-                        single_prompt["input_ids"].shape[1] + self.args.opdttt.opd_max_sample_length,
-                        self.args.data.max_seq_len,
-                    )
-
-                    # 自回归采样（使用 TTT cache）
-                    for step in range(max_length - single_prompt["input_ids"].shape[1]):
-                        # 学生前向传播获取logits（使用 TTT cache）
-                        outputs = self.student_model(
-                            input_ids=current_input,
-                            attention_mask=single_prompt["attention_mask"],
-                            use_cache=True,  # 启用 cache 以使用 TTT 状态
-                            past_key_values=ttt_cache,
+                        input_to_model = sampled_ids[-1]
+                        attn_mask = torch.cat(
+                            [attn_mask,
+                             torch.ones(1, 1, dtype=torch.float32, device=self.device)],
+                            dim=-1
                         )
 
-                        next_token_logits = outputs.logits[:, -1, :]  # [1, vocab_size]
+                    outputs = self.student_model(
+                        input_ids=input_to_model,
+                        attention_mask=attn_mask,
+                        use_cache=True,
+                        past_key_values=kv_cache,
+                    )
 
-                        # 应用温度和top-p采样
-                        if self.args.opdttt.opd_temperature > 0:
-                            next_token_logits = next_token_logits / self.args.opdttt.opd_temperature
+                    next_token_logits = outputs.logits[:, -1, :]
 
-                        # 计算logprobs（仅用于采样，不保留梯度）
-                        next_token_logprobs = F.log_softmax(next_token_logits, dim=-1)
+                    # 防止 logits 包含 nan/inf 导致采样失败
+                    next_token_logits = next_token_logits.float()
+                    next_token_logits = torch.nan_to_num(next_token_logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
-                        # Top-p (nucleus) sampling
-                        if self.args.opdttt.opd_top_p < 1.0:
-                            sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
-                            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                            sorted_indices_to_remove = cumulative_probs > self.args.opdttt.opd_top_p
-                            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                            sorted_indices_to_remove[..., 0] = 0
-                            indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                            next_token_logits[:, indices_to_remove] = float('-inf')
+                    if self.args.opdttt.opd_temperature > 0:
+                        next_token_logits = next_token_logits / self.args.opdttt.opd_temperature
 
-                        # 采样下一个token
-                        probs = F.softmax(next_token_logits, dim=-1)
-                        next_token = torch.multinomial(probs, num_samples=1)  # [1, 1]
-                        next_token_logprob = next_token_logprobs.gather(-1, next_token).squeeze(-1)
+                    next_token_logprobs = F.log_softmax(next_token_logits, dim=-1)
 
-                        sampled_ids.append(next_token)
-                        sampled_logprobs.append(next_token_logprob)
+                    if self.args.opdttt.opd_top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > self.args.opdttt.opd_top_p
+                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                        sorted_indices_to_remove[..., 0] = 0
+                        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                        next_token_logits[:, indices_to_remove] = float('-inf')
 
-                        # 检查是否生成EOS
-                        if next_token.item() == self.tokenizer.eos_token_id:
-                            break
+                    probs = F.softmax(next_token_logits, dim=-1)
+                    next_token = torch.multinomial(probs, num_samples=1)
+                    next_token_logprob = next_token_logprobs.gather(-1, next_token).squeeze(-1)
 
-                        # 更新输入
-                        current_input = torch.cat([current_input, next_token], dim=-1)
+                    sampled_ids.append(next_token)
+                    sampled_logprobs.append(next_token_logprob)
 
-                        # 更新attention mask
-                        if single_prompt["attention_mask"] is not None:
-                            single_prompt["attention_mask"] = torch.cat(
-                                [single_prompt["attention_mask"], torch.ones_like(next_token)], dim=-1
-                            )
+                    if next_token.item() == self.tokenizer.eos_token_id:
+                        break
 
-                # 构建完整轨迹
-                full_input_ids = torch.cat([single_prompt["input_ids"], torch.cat(sampled_ids, dim=-1)], dim=-1)
-                full_logprobs = torch.cat(sampled_logprobs, dim=-1) if sampled_logprobs else None
+                    step += 1
 
-                trajectories.append({
-                    "input_ids": full_input_ids,
-                    "sampled_logprobs": full_logprobs,  # 采样时的logprobs（no_grad）
-                    "prompt_length": single_prompt["input_ids"].shape[1],
-                    "ttt_cache": ttt_cache,  # 保存 TTT cache 用于训练时恢复
-                })
+            # 构建完整轨迹
+            if sampled_ids:
+                sampled_ids_tensor = torch.cat(sampled_ids, dim=-1)
+                full_input_ids = torch.cat([prompt_ids, sampled_ids_tensor], dim=-1)
+            else:
+                full_input_ids = prompt_ids
+            full_logprobs = torch.cat(sampled_logprobs, dim=-1) if sampled_logprobs else None
+
+
+
+            trajectories.append({
+                "input_ids": full_input_ids,
+                "sampled_logprobs": full_logprobs,
+                "prompt_length": actual_prompt_len,
+            })
 
         self.student_model.train()
+        for module in _fsdp_modules:
+            module.set_reshard_after_forward(True)
         return trajectories
 
     def compute_teacher_logprobs_on_sampled(
@@ -476,41 +502,32 @@ class OPDTTTTrainer:
             input_ids = trajectory["input_ids"].to(self.device)
             prompt_length = trajectory["prompt_length"]
 
-            # 只需要计算采样部分的教师logprobs
             if input_ids.shape[1] <= prompt_length:
+                teacher_logprobs_list.append(None)
                 continue
 
             sampled_ids = input_ids[:, prompt_length:]
 
             with torch.no_grad():
-                # 教师前向传播
                 outputs = self.teacher_model(
                     input_ids=input_ids,
-                    attention_mask=torch.ones_like(input_ids),
+                    attention_mask=torch.ones(input_ids.shape, dtype=torch.float32, device=input_ids.device),
                     use_cache=False,
                 )
 
-                # 获取采样位置的logits
-                sampled_logits = outputs.logits[:, prompt_length-1:-1, :]  # [1, sampled_length-1, vocab_size]
+                sampled_logits = outputs.logits[:, prompt_length-1:-1, :]
 
-                # 计算教师logprobs
                 teacher_logprobs = F.log_softmax(sampled_logits, dim=-1)
 
-                # 提取实际采样token的logprob
-                # teacher_logprobs: [1, sampled_length-1, vocab_size]
-                # sampled_ids[1:]: [1, sampled_length-1] (去掉第一个生成的token，因为它的logprob来自prompt)
-                sampled_tokens = sampled_ids[:, 1:] if sampled_ids.shape[1] > 1 else sampled_ids
-                if sampled_tokens.shape[1] > 0:
-                    sampled_tokens_reshaped = sampled_tokens.unsqueeze(-1)  # [1, sampled_length-1, 1]
-                    # 将teacher_logprobs调整到匹配维度
-                    if teacher_logprobs.shape[1] != sampled_tokens.shape[1]:
-                        # 处理维度不匹配的情况
-                        min_len = min(teacher_logprobs.shape[1], sampled_tokens.shape[1])
-                        teacher_logprobs = teacher_logprobs[:, :min_len, :]
-                        sampled_tokens_reshaped = sampled_tokens_reshaped[:, :min_len, :]
+                sampled_tokens_reshaped = sampled_ids.unsqueeze(-1)
 
-                    teacher_logprobs_on_sampled = teacher_logprobs.gather(-1, sampled_tokens_reshaped).squeeze(-1)
-                    teacher_logprobs_list.append(teacher_logprobs_on_sampled)
+                if teacher_logprobs.shape[1] != sampled_ids.shape[1]:
+                    min_len = min(teacher_logprobs.shape[1], sampled_ids.shape[1])
+                    teacher_logprobs = teacher_logprobs[:, :min_len, :]
+                    sampled_tokens_reshaped = sampled_tokens_reshaped[:, :min_len, :]
+
+                teacher_logprobs_on_sampled = teacher_logprobs.gather(-1, sampled_tokens_reshaped).squeeze(-1)
+                teacher_logprobs_list.append(teacher_logprobs_on_sampled)
 
         return teacher_logprobs_list
 
@@ -585,20 +602,14 @@ class OPDTTTTrainer:
     def train_step_opd(
         self,
         prompts_batch: Dict[str, torch.Tensor],
+        loss_scale: float = 1.0,
     ) -> float:
         """
         OPD模式的训练步骤（真正的on-policy distillation）
 
-        正确的两阶段流程：
-        1. 采样阶段（no_grad）：从学生模型采样轨迹
-        2. 训练阶段（保留梯度）：
-           a. 重新计算采样token的logprobs（保留梯度）
-           b. 计算教师logprobs（detach）
-           c. 计算reverse KL作为advantage（detach）
-           d. 使用重要性采样损失进行梯度更新
-
         Args:
             prompts_batch: 包含prompt的批次数据
+            loss_scale: 损失缩放因子（用于梯度累积归一化）
 
         Returns:
             该批次的损失值
@@ -616,50 +627,56 @@ class OPDTTTTrainer:
         )
 
         if not trajectories:
+
             return 0.0
 
         # 阶段2: 训练（保留梯度）
-        # 使用与采样时相同的 TTT cache 重新计算采样token的logprobs
-        # 关键：使用相同的 TTT cache 确保训练-推理一致性
+        # 重新计算采样token的logprobs（不带 KV cache，避免位置偏移）
         for trajectory in trajectories:
             input_ids = trajectory["input_ids"]
             prompt_length = trajectory["prompt_length"]
-            ttt_cache = trajectory.get("ttt_cache")
+
+
 
             if input_ids.shape[1] <= prompt_length:
                 trajectory["student_logprobs_with_grad"] = None
+
                 continue
 
-            # 克隆 TTT cache 以避免修改采样的 cache
-            import copy
-            new_ttt_cache = copy.deepcopy(ttt_cache)
+            input_ids = input_ids.to(self.device)
 
-            # 使用 TTT cache 重新计算学生logprobs（保留梯度！）
             outputs = self.student_model(
                 input_ids=input_ids,
-                attention_mask=torch.ones_like(input_ids),
-                use_cache=True,
-                past_key_values=new_ttt_cache,
+                attention_mask=torch.ones(input_ids.shape, dtype=torch.float32, device=input_ids.device),
+                use_cache=False,
             )
 
-            # 获取采样位置的logits
-            # 注意：采样位置的第一个token（prompt后第一个）的logprob在position prompt_length-1
             sampled_logits = outputs.logits[:, prompt_length-1:-1, :]
             sampled_logprobs = F.log_softmax(sampled_logits, dim=-1)
 
-            # 提取采样token的logprob
-            # 采样token从prompt_length+1开始（因为我们预测下一个token）
-            sampled_ids = input_ids[:, prompt_length+1:] if input_ids.shape[1] > prompt_length + 1 else input_ids[:, prompt_length:]
+            sampled_ids = input_ids[:, prompt_length:]
 
             if sampled_ids.shape[1] > 0 and sampled_logprobs.shape[1] == sampled_ids.shape[1]:
                 sampled_ids_reshaped = sampled_ids.unsqueeze(-1)
                 student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
                 trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
+
             else:
-                trajectory["student_logprobs_with_grad"] = None
+                min_len = min(sampled_logprobs.shape[1], sampled_ids.shape[1])
+
+                if min_len > 0:
+                    sampled_logprobs = sampled_logprobs[:, :min_len, :]
+                    sampled_ids_trimmed = input_ids[:, prompt_length:prompt_length + min_len]
+                    sampled_ids_reshaped = sampled_ids_trimmed.unsqueeze(-1)
+                    student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
+                    trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
+                else:
+                    trajectory["student_logprobs_with_grad"] = None
 
         # 2b. 计算教师logprobs（detach）
         teacher_logprobs_list = self.compute_teacher_logprobs_on_sampled(trajectories)
+
+
 
         # 2c & 2d. 计算重要性采样损失（使用有梯度的学生logprobs）
         loss = self.compute_importance_sampling_loss_with_grad(
@@ -667,7 +684,11 @@ class OPDTTTTrainer:
             teacher_logprobs_list,
         )
 
+
+
         # 反向传播
+        # 乘以 dp_size 补偿 FSDP2 梯度平均，乘以 loss_scale 用于梯度累积归一化
+        loss = loss * self.parallel_state.dp_size * loss_scale
         with self.model_bwd_context:
             loss.backward()
 
@@ -701,11 +722,17 @@ class OPDTTTTrainer:
             if student_logprobs is None or teacher_logprobs is None:
                 continue
 
-            # student_logprobs形状: [sampled_length]
+            # student_logprobs可能为 [1, sampled_length] 或 [sampled_length]
             # teacher_logprobs形状: [1, sampled_length]
 
+            # 确保 student_logprobs 为 1D
+            if student_logprobs.dim() == 2:
+                student_logprobs = student_logprobs[0]
+
             # 对齐维度
-            min_len = min(student_logprobs.shape[0], teacher_logprobs.shape[1])
+            seq_len_s = student_logprobs.shape[0]
+            seq_len_t = teacher_logprobs.shape[-1]
+            min_len = min(seq_len_s, seq_len_t)
             if min_len == 0:
                 continue
 
@@ -879,8 +906,13 @@ class OPDTTTTrainer:
                 total_loss = 0.0
                 if enable_opd:
                     # OPD模式：从学生采样并使用重要性采样
+                    # 需要按 micro-batch 数量归一化梯度，使累积梯度等于全局平均
+                    num_micro_batches = len(micro_batches)
                     for micro_batch in micro_batches:
-                        loss = self.train_step_opd(prompts_batch=micro_batch)
+                        loss = self.train_step_opd(
+                            prompts_batch=micro_batch,
+                            loss_scale=1.0 / max(num_micro_batches, 1),
+                        )
                         total_loss += loss
                         del micro_batch
                 else:
@@ -988,7 +1020,7 @@ class OPDTTTTrainer:
             ckpt_manager=self.args.train.ckpt_manager,
         )
 
-        save_model_weights(save_path, model_state_dict, model_assets=None)
+        save_model_weights(save_path, model_state_dict, model_assets=[self.model_config] if self.model_config else None)
         logger.info(f"HuggingFace 权重已保存: {save_path}")
 
 
@@ -1013,8 +1045,8 @@ def build_teacher_model(
         教师模型（如果路径有效），否则返回 None
     """
     # 处理空字符串和字面量 "" 的情况
-    teacher_path = teacher_path.strip() if teacher_path else ""
-    if teacher_path in ['""', "''", '']:
+    teacher_path = teacher_path.strip().strip("'\"") if teacher_path else ""
+    if not teacher_path:
         return None
 
     logger.info(f"加载教师模型: {teacher_path}")
@@ -1117,23 +1149,35 @@ def main():
         args.data.train_size / (args.train.global_batch_size * args.data.max_seq_len)
     )
 
-    # 构建 collate_fn_kwargs，启用 pad_to_length 确保序列长度一致
-    collate_fn_kwargs = {
-        "pad_to_length": args.data.max_seq_len,  # 将序列 padding 到 max_seq_len
-    }
+    # OPD模式：禁用动态打包，每个micro_batch是一个单独的prompt
+    # 标准模式：使用动态打包填充到max_seq_len
+    if args.opdttt.enable_opd_sampling:
+        opd_pad_to_length = min(2048, args.data.max_seq_len)
+        collate_fn_kwargs = {
+            "pad_to_length": opd_pad_to_length,
+        }
+        use_dyn_bsz = False
+        # dyn_bsz=False时，dataloader_batch_size = global_batch_size / dp_size
+        opd_dataloader_batch_size = args.train.global_batch_size // args.train.data_parallel_size
+        logger.info_rank0(f"OPD模式: dyn_bsz=False, pad_to_length={opd_pad_to_length}, dataloader_batch_size={opd_dataloader_batch_size}")
+    else:
+        collate_fn_kwargs = {
+            "pad_to_length": args.data.max_seq_len,
+        }
+        use_dyn_bsz = getattr(args.train, "dyn_bsz", True)
+        opd_dataloader_batch_size = args.train.dataloader_batch_size
 
     train_dataloader = build_dataloader(
         dataloader_type=args.data.dataloader.type,
         dataset=train_dataset,
         micro_batch_size=args.train.micro_batch_size,
         global_batch_size=args.train.global_batch_size,
-        dataloader_batch_size=args.train.dataloader_batch_size,
+        dataloader_batch_size=opd_dataloader_batch_size,
         seed=args.train.seed,
         max_seq_len=args.data.max_seq_len,
         train_steps=train_steps,
-        # 注意: native dataloader 不支持 rmpad 和 rmpad_with_pos_ids 参数
         dyn_bsz_buffer_size=getattr(args.data, "dyn_bsz_buffer_size", 500),
-        dyn_bsz=getattr(args.train, "dyn_bsz", True),
+        dyn_bsz=use_dyn_bsz,
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         collate_fn_kwargs=collate_fn_kwargs,
@@ -1149,13 +1193,14 @@ def main():
     # 应用 OPD-TTT 设置
     config.opdttt_mode = True
     config.opdttt_layers = args.opdttt.opdttt_layers
-    config.lambda_kl = args.opdttt.lambda_kl
-    config.lambda_lm = args.opdttt.lambda_lm
-    config.lambda_ntp = args.opdttt.lambda_ntp
-    config.lambda_align_rep = args.opdttt.lambda_align_rep
-    config.ttt_lr = args.opdttt.ttt_lr
-    config.ttt_chunk = args.opdttt.ttt_chunk
+    config.lambda_kl = float(args.opdttt.lambda_kl)
+    config.lambda_lm = float(args.opdttt.lambda_lm)
+    config.lambda_ntp = float(args.opdttt.lambda_ntp)
+    config.lambda_align_rep = float(args.opdttt.lambda_align_rep)
+    config.ttt_lr = float(args.opdttt.ttt_lr)
+    config.ttt_chunk = int(args.opdttt.ttt_chunk)
     config.ttt_proj = args.opdttt.ttt_proj
+    config.ttt_max_norm = float(args.opdttt.ttt_max_norm)
     config.ttt_target = "input_embed"
 
     # 新增：自适应权重和 PCA 初始化设置
@@ -1173,7 +1218,8 @@ def main():
     # 处理空字符串和字面量 "" 的情况
     teacher_path = args.opdttt.teacher_model_path.strip() if args.opdttt.teacher_model_path else ""
     # 移除可能的引号包裹
-    if teacher_path in ['""', "''"]:
+    teacher_path = teacher_path.strip("'\"")
+    if not teacher_path:
         teacher_path = ""
 
     if teacher_path:
@@ -1198,6 +1244,62 @@ def main():
         if os.path.isfile(os.path.join(model_path, f))
     ) if os.path.isdir(model_path) else False
 
+    # FSDP2 会从 weights_path 重新加载权重（不经过 from_pretrained），
+    # 需要确保 checkpoint 中不存在形状不匹配的参数。
+    # 当 teacher_hidden_size 变化时（如从 SFT 到 OPD），teacher_proj.weight 会不匹配。
+    fsdp_weights_path = args.model.model_path if has_weights else None
+    if has_weights:
+        from safetensors import safe_open
+        import tempfile
+        from collections import OrderedDict
+
+        # 用 meta device 创建模型来获取期望的参数形状
+        with torch.device("meta"):
+            meta_model = OPDTTTForCausalLM(config)
+
+        expected_shapes = {
+            name: param.shape for name, param in meta_model.named_parameters()
+        }
+
+        # 检查 checkpoint 中的参数形状是否匹配
+        mismatched_keys = []
+        for f in os.listdir(model_path):
+            if not f.endswith('.safetensors'):
+                continue
+            filepath = os.path.join(model_path, f)
+            with safe_open(filepath, framework="pt") as st:
+                for key in st.keys():
+                    if key in expected_shapes and tuple(st.get_tensor(key).shape) != tuple(expected_shapes[key]):
+                        mismatched_keys.append(key)
+
+        del meta_model
+
+        if mismatched_keys:
+            logger.info_rank0(f"检测到形状不匹配的参数: {mismatched_keys}")
+            logger.info_rank0("创建过滤后的临时 checkpoint（跳过不匹配参数）")
+
+            # 创建临时目录保存过滤后的 checkpoint
+            tmp_dir = tempfile.mkdtemp(prefix="opdttt_ckpt_", dir=os.path.join(_project_root, "data", "output"))
+            for f in os.listdir(model_path):
+                src = os.path.join(model_path, f)
+                if not f.endswith('.safetensors'):
+                    import shutil
+                    shutil.copy2(src, os.path.join(tmp_dir, f))
+                    continue
+                # 过滤不匹配的 key
+                from safetensors.torch import save_file
+                filtered = {}
+                with safe_open(src, framework="pt") as st:
+                    for key in st.keys():
+                        if key not in mismatched_keys:
+                            filtered[key] = st.get_tensor(key).clone()
+                save_file(filtered, os.path.join(tmp_dir, f))
+                logger.info_rank0(f"已过滤 {len(mismatched_keys)} 个不匹配参数，保存到 {tmp_dir}")
+
+            fsdp_weights_path = tmp_dir
+        else:
+            fsdp_weights_path = model_path
+
     if has_weights:
         logger.info_rank0(f"从预训练权重加载模型: {model_path}")
         student_model = OPDTTTForCausalLM.from_pretrained(
@@ -1205,6 +1307,7 @@ def main():
             config=config,
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
+            ignore_mismatched_sizes=True,
         )
     else:
         logger.info_rank0(f"从配置初始化模型 (训练从开始): {config_path}")
@@ -1227,11 +1330,11 @@ def main():
         student_model = student_model.to(device)
 
     # 并行化模型
-    # 注意：当从配置初始化时（has_weights=False），weights_path 应为 None
+    # 使用过滤后的 checkpoint 路径（跳过形状不匹配的参数）
     student_model = build_parallelize_model(
         student_model,
         init_device=args.train.init_device,
-        weights_path=args.model.model_path if has_weights else None,
+        weights_path=fsdp_weights_path if has_weights else None,
         enable_full_shard=args.train.enable_full_shard,
         enable_mixed_precision=args.train.enable_mixed_precision,
         enable_gradient_checkpointing=args.train.enable_gradient_checkpointing,
@@ -1244,21 +1347,28 @@ def main():
 
     helper.print_device_mem_info("构建学生模型后的显存使用")
 
-    # 构建教师模型（仅在 rank 0 且有教师路径时）
+    # 构建教师模型
+    # OPD模式下每个rank都需要教师模型来计算teacher logprobs
+    # 非OPD模式下仅rank0需要（用于teacher-student对齐损失）
     teacher_model = None
-    # 检查 teacher_model_path 是否非空且不是仅包含空格
-    teacher_path = args.opdttt.teacher_model_path.strip() if args.opdttt.teacher_model_path else ""
-    if teacher_path and args.train.global_rank == 0:
-        # 使用设备字符串而不是模块，避免 pickle 错误
+    teacher_path = args.opdttt.teacher_model_path.strip().strip("'\"") if args.opdttt.teacher_model_path else ""
+    if not teacher_path:
+        teacher_path = ""
+    need_teacher = bool(teacher_path) and (
+        args.opdttt.enable_opd_sampling
+        or args.opdttt.lambda_kl > 0
+        or args.opdttt.lambda_align_rep > 0
+    )
+    if need_teacher:
         device_str = f"{get_device_type()}:{args.train.local_rank}"
         teacher_model = build_teacher_model(
             teacher_path,
-            device_str,  # 使用设备字符串
+            device_str,
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
-            tokenizer=tokenizer,  # 传递统一 tokenizer 用于检查 vocab_size 一致性
+            tokenizer=tokenizer,
         )
-        logger.info_rank0(f"教师模型已加载: {teacher_path}")
+        logger.info(f"[rank {args.train.global_rank}] 教师模型已加载: {teacher_path}")
     else:
         logger.info_rank0("未配置教师模型，使用无教师模式训练")
 

@@ -74,7 +74,7 @@ if [ ! -f "data/opd_sft_val.jsonl" ]; then
 fi
 
 # 检查阶段1 checkpoint是否存在
-STAGE1_CKPT=$(grep "model_path:" "$CONFIG" | awk '{print $2}' | tr -d '"')
+STAGE1_CKPT=$(grep -P "^\s+model_path:" "$CONFIG" | awk '{print $2}' | tr -d '"')
 if [ ! -d "$STAGE1_CKPT" ]; then
     echo "错误: 未找到阶段1 checkpoint: $STAGE1_CKPT" | tee -a "$LOG_FILE"
     echo "请先完成阶段1预训练" | tee -a "$LOG_FILE"

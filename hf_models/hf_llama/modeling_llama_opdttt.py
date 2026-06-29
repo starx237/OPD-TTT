@@ -188,7 +188,7 @@ class OPDTTTMLP(nn.Module):
                 self.hidden_size,
                 self.hidden_size,
                 kernel_size=5,
-                padding=2,
+                padding=0,
                 groups=self.hidden_size,
                 bias=False,
             )
@@ -250,8 +250,10 @@ class OPDTTTMLP(nn.Module):
 
         # 计算 NTP 目标：使用因果卷积预测"下一Token"的表示
         # 因果卷积确保位置 t 只能看到 t 之前的信息
+        t_reshaped = t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size)
+        t_causal_padded = F.pad(t_reshaped, (4, 0))
         ntp_target = (
-            self.ntp_target_proj(t.transpose(-1, -2).reshape(bs * chunk_num, -1, chunk_size))
+            self.ntp_target_proj(t_causal_padded)
             .transpose(-1, -2)
             .reshape(bs, chunk_num, chunk_size, -1)
         )
@@ -262,6 +264,15 @@ class OPDTTTMLP(nn.Module):
 
         # 计算快速权重更新
         # 关键：所有分块的增量可以并行计算（因为 NTP 目标只依赖输入，不依赖当前权重）
+
+        # 当只有1个分块时，没有足够的上下文进行快速权重更新
+        # 直接使用原始 MLP 权重
+        if chunk_num <= 1:
+            ntp_target_3d = rearrange(ntp_target, "b t c d -> b (t c) d")[:, : x.shape[1], :]
+            loss_dict = {
+                "ntp_loss": self._compute_repr_loss(self.down_proj(h)[:, :-1], ntp_target_3d[:, 1:]),
+            }
+            return self.down_proj(h), loss_dict
 
         # 1. NTP 对齐分量：使 MLP 输出能够预测下一Token的表示
         # 注意：einsum 在 BFloat16 下可能不稳定，转换为 float32 进行计算
@@ -365,7 +376,7 @@ class OPDTTTMLP(nn.Module):
         output = rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
 
         # 将目标从4维 (b, t, c, d) reshape成3维 (b, t*c, d) 以匹配output的形状
-        ntp_target_3d = rearrange(ntp_target, "b t c d -> b (t c) d")
+        ntp_target_3d = rearrange(ntp_target, "b t c d -> b (t c) d")[:, : x.shape[1], :]
 
         # 计算表示对齐损失（用于监控）
         loss_dict = {
@@ -478,25 +489,33 @@ class OPDTTTLoss(nn.Module):
         """
         loss_dict = {}
         total_loss = 0.0
+        has_gradient_loss = False
 
         # 1. KL 散度损失：KL(student || teacher)
-        # 使用反向 KL 使学生分布接近教师分布
         if teacher_logits is not None:
             kl_loss = self._compute_kl_divergence(student_logits, teacher_logits, attention_mask)
             loss_dict["kl_loss"] = kl_loss
             total_loss += self.lambda_kl * kl_loss
+            if self.lambda_kl > 0:
+                has_gradient_loss = True
 
         # 2. 标准语言建模损失：交叉熵与真实标签
         lm_loss = self._compute_lm_loss(student_logits, labels, attention_mask)
         loss_dict["lm_loss"] = lm_loss
         total_loss += self.lambda_lm * lm_loss
+        if self.lambda_lm > 0:
+            has_gradient_loss = True
 
         # 3. NTP 对齐损失（来自 MLP 层，用于监控）
-        # 这些损失已在 MLP 层中用于更新快速权重，这里记录用于日志
         if ntp_losses is not None:
             for key, value in ntp_losses.items():
                 if value is not None and isinstance(value, torch.Tensor):
                     loss_dict[key] = value.detach()
+
+        # 当所有损失权重为0时，total_loss 是 Python float 0.0（无梯度）
+        # 需要返回一个带梯度的零张量，否则 backward() 会失败
+        if not has_gradient_loss and isinstance(total_loss, (int, float)):
+            total_loss = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
 
         loss_dict["total_loss"] = total_loss
         return total_loss, loss_dict

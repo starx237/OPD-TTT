@@ -25,11 +25,9 @@ TEACHER_MODEL=${2:-"qwen2.5-7b"}  # 教师模型别名
 # 根据模型大小设置配置
 case $MODEL_SIZE in
     "500m")
-        STAGE1_CKPT="data/output/500m_stage1_pretrain/checkpoints/global_step_9575/hf_ckpt"
         CONFIG="configs/opdttt/llama3_sc_500m_stage2_opd.yaml"
         ;;
     "1b5")
-        STAGE1_CKPT="data/output/1b5_stage1_pretrain/checkpoints/global_step_14325/hf_ckpt"
         CONFIG="configs/opdttt/llama3_sc_1b5_stage2_opd.yaml"
         ;;
     *)
@@ -37,6 +35,9 @@ case $MODEL_SIZE in
         exit 1
         ;;
 esac
+
+# 从配置文件读取模型路径（以配置文件为准）
+STAGE1_CKPT=$(grep -P "^\s+model_path:" "$CONFIG" | awk '{print $2}' | tr -d '"')
 
 # 解析教师模型路径
 case $TEACHER_MODEL in
@@ -86,21 +87,20 @@ if [ -n "$TEACHER_PATH" ] && [ ! -d "$TEACHER_PATH" ]; then
 fi
 
 # 阶段2特定参数（启用真正的OPD采样）
-STAGE2_ARGS="--opdttt.teacher_model_path='$TEACHER_PATH' \
-             --opdttt.enable_opd_sampling=true \
-             --opdttt.opd_temperature=1.0 \
-             --opdttt.opd_top_p=0.9 \
-             --opdttt.opd_max_sample_length=2048 \
-             --opdttt.opd_num_trajectories=1 \
-             --opdttt.opd_prompt_field=prompt \
-             --opdttt.lambda_align_rep=0.0 \
-             --opdttt.lambda_kl=0.0 \
-             --opdttt.lambda_lm=0.0 \
-             --opdttt.lambda_ntp=1.0"
+# 注意：teacher_model_path 已在配置文件中设置，此处不再冗余覆盖
+# 损失权重等参数也已在配置文件中设置，此处仅覆盖采样相关参数
+STAGE2_ARGS="--opdttt.enable_opd_sampling=true"
+
+# 自动检测可见 GPU 数量
+NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
+if [ -z "$CUDA_VISIBLE_DEVICES" ] || [ "$CUDA_VISIBLE_DEVICES" = "0,1,2,3,4,5,6,7" ]; then
+    NUM_GPUS=8
+fi
+echo "使用 $NUM_GPUS 个 GPU" | tee -a "$LOG_FILE"
 
 # 启动训练，输出到日志文件（配置文件作为位置参数）
 torchrun \
-    --nproc_per_node=8 \
+    --nproc_per_node=$NUM_GPUS \
     --master_port=29500 \
     tasks/train_opdttt.py \
     "$CONFIG" \
