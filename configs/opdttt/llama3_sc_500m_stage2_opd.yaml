@@ -28,7 +28,7 @@ train:
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 1
   global_batch_size: 35       # 较小batch，因为OPD密集奖励
-  micro_batch_size: 1
+  micro_batch_size: 7
   rmpad: false
   use_wandb: true
   wandb_project: opdttt-experiments
@@ -74,7 +74,7 @@ opdttt:
 
   # OPD采样参数（扁平结构，匹配dataclass字段名）
   opd_temperature: 1.0
-  opd_max_sample_length: 512
+  opd_max_sample_length: 2048
   opd_top_p: 0.9
   opd_num_trajectories: 1
   opd_prompt_field: prompt

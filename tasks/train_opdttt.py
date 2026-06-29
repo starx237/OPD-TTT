@@ -338,146 +338,220 @@ class OPDTTTTrainer:
 
         return result
 
+    def _build_sampling_model(self):
+        if hasattr(self, '_sampling_model') and self._sampling_model is not None:
+            return self._sampling_model
+        from hf_models.hf_llama import OPDTTTForCausalLM
+        config_path = self.args.model.config_path or self.args.model.model_path
+        model_path = self.args.model.model_path
+
+        if model_path and os.path.isdir(model_path):
+            sampling_model = OPDTTTForCausalLM.from_pretrained(
+                model_path,
+                config=AutoConfig.from_pretrained(config_path),
+                torch_dtype=torch.bfloat16,
+                ignore_mismatched_sizes=True,
+            )
+        else:
+            sampling_model = OPDTTTForCausalLM.from_pretrained(
+                config_path,
+                torch_dtype=torch.bfloat16,
+                ignore_mismatched_sizes=True,
+            )
+
+        sampling_model = sampling_model.to(self.device)
+        sampling_model.eval()
+        self._sampling_model = sampling_model
+        self._update_sampling_model()
+        return sampling_model
+
+    def _update_sampling_model(self):
+        if not hasattr(self, '_sampling_model') or self._sampling_model is None:
+            return
+        fsdp_params = dict(self.student_model.named_parameters())
+        for name, param in self._sampling_model.named_parameters():
+            if name in fsdp_params:
+                src = fsdp_params[name]
+                if src.shape == param.shape:
+                    full = src.full_tensor() if hasattr(src, 'full_tensor') else src
+                    param.data.copy_(full.detach())
+
     def sample_from_student(
         self,
         prompts: Dict[str, torch.Tensor],
         num_trajectories: int = 1,
     ) -> List[Dict[str, torch.Tensor]]:
-        """
-        从学生模型采样轨迹（OPD核心步骤）
-
-        每个micro_batch是一个单独的prompt（OPD模式禁用了动态打包）。
-        使用labels中的非IGNORE_INDEX部分来确定实际prompt长度。
-        """
         self.student_model.eval()
         trajectories = []
 
-        # 采样时禁用 FSDP2 reshard，避免每步 all_gather
-        _fsdp_modules = []
-        for module in self.student_model.modules():
-            if hasattr(module, 'set_reshard_after_forward'):
-                _fsdp_modules.append(module)
-        for module in _fsdp_modules:
-            module.set_reshard_after_forward(False)
+        sampling_model = self._build_sampling_model()
+        self._update_sampling_model()
 
         input_ids = prompts["input_ids"].to(self.device)
         labels = prompts.get("labels")
         if labels is not None:
             labels = labels.to(self.device)
 
-        # 通过 labels 确定 prompt 的实际长度
-        # labels中非IGNORE_INDEX的部分是真实token，之后是padding（IGNORE_INDEX）
-        if labels is not None:
-            actual_prompt_len = (labels[0] != -100).sum().item()
-        else:
-            actual_prompt_len = input_ids.shape[1]
-
-        # 截取真实prompt（去除padding）
-        prompt_ids = input_ids[:, :actual_prompt_len]
-
-        # 去除末尾的 EOS token（process_plaintext_example 添加的）
-        # 否则模型看到 EOS 后会立即停止采样
+        batch_size = input_ids.shape[0]
         eos_token_id = self.tokenizer.eos_token_id
-        if prompt_ids.shape[1] > 1 and prompt_ids[0, -1].item() == eos_token_id:
-            prompt_ids = prompt_ids[:, :-1]
-            actual_prompt_len = prompt_ids.shape[1]
+        max_sample_length = self.args.opdttt.opd_max_sample_length
+        max_seq_len = self.args.data.max_seq_len
+        temperature = self.args.opdttt.opd_temperature
+        top_p = self.args.opdttt.opd_top_p
 
-
+        prompt_lens = []
+        prompt_list = []
+        for batch_idx in range(batch_size):
+            if labels is not None:
+                actual_prompt_len = (labels[batch_idx] != -100).sum().item()
+            else:
+                actual_prompt_len = input_ids.shape[1]
+            p_ids = input_ids[batch_idx:batch_idx+1, :actual_prompt_len]
+            if p_ids.shape[1] > 1 and p_ids[0, -1].item() == eos_token_id:
+                p_ids = p_ids[:, :-1]
+                actual_prompt_len = p_ids.shape[1]
+            prompt_lens.append(actual_prompt_len)
+            prompt_list.append(p_ids.squeeze(0))
 
         for i in range(num_trajectories):
             with torch.no_grad():
                 from transformers.cache_utils import DynamicCache
 
-                kv_cache = DynamicCache()
+                max_prompt_len = max(prompt_lens)
+                bs = len(prompt_list)
 
-                sampled_ids = []
-                sampled_logprobs = []
+                # Pad all prompts to max_prompt_len
+                padded = torch.full((bs, max_prompt_len), self.tokenizer.pad_token_id,
+                                    dtype=torch.long, device=self.device)
+                attn_mask = torch.zeros(bs, max_prompt_len, dtype=torch.float32, device=self.device)
+                for bi in range(bs):
+                    plen = prompt_lens[bi]
+                    padded[bi, :plen] = prompt_list[bi][:plen]
+                    attn_mask[bi, :plen] = 1.0
 
-                max_length = min(
-                    actual_prompt_len + self.args.opdttt.opd_max_sample_length,
-                    self.args.data.max_seq_len,
-                )
-
-                max_new_tokens = max_length - actual_prompt_len
+                # Compute max_new_tokens across all prompts
+                max_new_tokens = min(max_prompt_len + max_sample_length, max_seq_len) - max_prompt_len
                 if max_new_tokens <= 0:
-                    trajectories.append({
-                        "input_ids": prompt_ids,
-                        "sampled_logprobs": None,
-                        "prompt_length": actual_prompt_len,
-                    })
+                    for bi in range(bs):
+                        trajectories.append({
+                            "input_ids": prompt_list[bi].unsqueeze(0),
+                            "sampled_logprobs": None,
+                            "prompt_length": prompt_lens[bi],
+                        })
                     continue
 
-                step = 0
-                attn_mask = torch.ones(1, actual_prompt_len, dtype=torch.float32, device=self.device)
-                while len(sampled_ids) < max_new_tokens:
-                    if step == 0:
-                        input_to_model = prompt_ids
-                    else:
-                        input_to_model = sampled_ids[-1]
-                        attn_mask = torch.cat(
-                            [attn_mask,
-                             torch.ones(1, 1, dtype=torch.float32, device=self.device)],
-                            dim=-1
-                        )
+                kv_cache = DynamicCache()
 
-                    outputs = self.student_model(
-                        input_ids=input_to_model,
+                # First forward: all prompts at once
+                outputs = sampling_model(
+                    input_ids=padded,
+                    attention_mask=attn_mask,
+                    use_cache=True,
+                    past_key_values=kv_cache,
+                )
+                next_logits = outputs.logits[:, -1, :].float()
+                next_logits = torch.nan_to_num(next_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+                if temperature > 0:
+                    next_logits = next_logits / temperature
+
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_mask = cumulative_probs > top_p
+                    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                    sorted_mask[..., 0] = 0
+                    mask = torch.zeros_like(next_logits, dtype=torch.bool)
+                    mask.scatter_(1, sorted_indices, sorted_mask)
+                    next_logits[mask] = float('-inf')
+
+                next_logprobs = F.log_softmax(next_logits, dim=-1)
+                probs = F.softmax(next_logits, dim=-1)
+                next_tokens = torch.multinomial(probs, num_samples=1)  # [bs, 1]
+                next_token_logprobs = next_logprobs.gather(-1, next_tokens).squeeze(-1)  # [bs]
+
+                # Track per-sequence state
+                all_sampled = [next_tokens]  # list of [bs, 1]
+                all_logprobs = [next_token_logprobs]  # list of [bs]
+                finished = (next_tokens.squeeze(-1) == eos_token_id)  # [bs]
+
+                attn_mask = torch.cat([attn_mask, torch.ones(bs, 1, device=self.device)], dim=-1)
+
+                for step in range(1, max_new_tokens):
+                    # Replace finished sequences' input with pad token (but keep in batch)
+                    input_tokens = next_tokens.clone()
+                    input_tokens[finished] = self.tokenizer.pad_token_id
+
+                    outputs = sampling_model(
+                        input_ids=input_tokens,
                         attention_mask=attn_mask,
                         use_cache=True,
                         past_key_values=kv_cache,
                     )
 
-                    next_token_logits = outputs.logits[:, -1, :]
+                    next_logits = outputs.logits[:, -1, :].float()
+                    next_logits = torch.nan_to_num(next_logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
-                    # 防止 logits 包含 nan/inf 导致采样失败
-                    next_token_logits = next_token_logits.float()
-                    next_token_logits = torch.nan_to_num(next_token_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+                    if temperature > 0:
+                        next_logits = next_logits / temperature
 
-                    if self.args.opdttt.opd_temperature > 0:
-                        next_token_logits = next_token_logits / self.args.opdttt.opd_temperature
-
-                    next_token_logprobs = F.log_softmax(next_token_logits, dim=-1)
-
-                    if self.args.opdttt.opd_top_p < 1.0:
-                        sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
                         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                        sorted_indices_to_remove = cumulative_probs > self.args.opdttt.opd_top_p
-                        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-                        sorted_indices_to_remove[..., 0] = 0
-                        indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                        next_token_logits[:, indices_to_remove] = float('-inf')
+                        sorted_mask = cumulative_probs > top_p
+                        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+                        sorted_mask[..., 0] = 0
+                        mask = torch.zeros_like(next_logits, dtype=torch.bool)
+                        mask.scatter_(1, sorted_indices, sorted_mask)
+                        next_logits[mask] = float('-inf')
 
-                    probs = F.softmax(next_token_logits, dim=-1)
-                    next_token = torch.multinomial(probs, num_samples=1)
-                    next_token_logprob = next_token_logprobs.gather(-1, next_token).squeeze(-1)
+                    next_logprobs = F.log_softmax(next_logits, dim=-1)
+                    probs = F.softmax(next_logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1)
+                    next_token_logprobs = next_logprobs.gather(-1, next_tokens).squeeze(-1)
 
-                    sampled_ids.append(next_token)
-                    sampled_logprobs.append(next_token_logprob)
+                    # Mask out finished sequences
+                    next_tokens[finished] = eos_token_id
+                    next_token_logprobs[finished] = 0.0
 
-                    if next_token.item() == self.tokenizer.eos_token_id:
+                    all_sampled.append(next_tokens)
+                    all_logprobs.append(next_token_logprobs)
+
+                    newly_finished = (next_tokens.squeeze(-1) == eos_token_id) & ~finished
+                    finished = finished | newly_finished
+
+                    attn_mask = torch.cat([attn_mask, torch.ones(bs, 1, device=self.device)], dim=-1)
+
+                    if finished.all():
                         break
 
-                    step += 1
+                # Unpack per-sequence results
+                # all_sampled: list of [bs, 1], all_logprobs: list of [bs]
+                stacked_tokens = torch.cat(all_sampled, dim=1)  # [bs, num_steps]
+                stacked_logprobs = torch.stack(all_logprobs, dim=1)  # [bs, num_steps]
 
-            # 构建完整轨迹
-            if sampled_ids:
-                sampled_ids_tensor = torch.cat(sampled_ids, dim=-1)
-                full_input_ids = torch.cat([prompt_ids, sampled_ids_tensor], dim=-1)
-            else:
-                full_input_ids = prompt_ids
-            full_logprobs = torch.cat(sampled_logprobs, dim=-1) if sampled_logprobs else None
+                for bi in range(bs):
+                    plen = prompt_lens[bi]
+                    # Find EOS position for this sequence
+                    seq_tokens = stacked_tokens[bi]  # [num_steps]
+                    eos_positions = (seq_tokens == eos_token_id).nonzero(as_tuple=True)[0]
+                    if len(eos_positions) > 0:
+                        cut = eos_positions[0].item() + 1  # include EOS
+                    else:
+                        cut = seq_tokens.shape[0]
 
+                    sampled_ids_tensor = seq_tokens[:cut].unsqueeze(0)  # [1, cut]
+                    sampled_logprobs_tensor = stacked_logprobs[bi, :cut]  # [cut]
 
+                    full_input_ids = torch.cat([prompt_list[bi].unsqueeze(0), sampled_ids_tensor], dim=-1)
 
-            trajectories.append({
-                "input_ids": full_input_ids,
-                "sampled_logprobs": full_logprobs,
-                "prompt_length": actual_prompt_len,
-            })
+                    trajectories.append({
+                        "input_ids": full_input_ids,
+                        "sampled_logprobs": sampled_logprobs_tensor,
+                        "prompt_length": plen,
+                    })
 
         self.student_model.train()
-        for module in _fsdp_modules:
-            module.set_reshard_after_forward(True)
         return trajectories
 
     def compute_teacher_logprobs_on_sampled(
@@ -559,13 +633,11 @@ class OPDTTTTrainer:
             if teacher_logprobs is None:
                 continue
 
-            # 学生的采样logprobs（需要保留梯度）
             student_logprobs = trajectory["sampled_logprobs"]
 
             if student_logprobs is None or teacher_logprobs is None:
                 continue
 
-            # 对齐维度
             min_len = min(student_logprobs.shape[0], teacher_logprobs.shape[1])
             if min_len == 0:
                 continue
@@ -573,22 +645,11 @@ class OPDTTTTrainer:
             student_logprobs = student_logprobs[:min_len]
             teacher_logprobs = teacher_logprobs[0, :min_len]
 
-            # 计算reverse KL作为advantage（必须detach，作为reward信号）
-            # reverse_KL = student_logprob - teacher_logprob
-            # advantage = -reverse_KL = teacher_logprob - student_logprob
             reverse_kl = (student_logprobs.detach() - teacher_logprobs.detach())
-            advantages = -reverse_kl  # = teacher_logprob - student_logprob
+            advantages = -reverse_kl
 
-            # 重要性采样权重（关键：分子保留梯度，分母detach）
-            # 在标准RL中：rho = pi_theta(a|s) / pi_theta_old(a|s)
-            # 在OPD中：theta_old = theta，所以：
-            # rho = exp(logprob) / exp(logprob.detach()) = exp(logprob - logprob.detach())
-            # 数值上rho = 1，但梯度保留在分子中
             rho = torch.exp(student_logprobs - student_logprobs.detach())
 
-            # 重要性采样策略梯度损失
-            # loss = -rho * advantage
-            # 这确保梯度能正确传播到student_logprobs
             loss_per_token = -rho * advantages
 
             total_loss += loss_per_token.sum()
@@ -604,43 +665,29 @@ class OPDTTTTrainer:
         prompts_batch: Dict[str, torch.Tensor],
         loss_scale: float = 1.0,
     ) -> float:
-        """
-        OPD模式的训练步骤（真正的on-policy distillation）
-
-        Args:
-            prompts_batch: 包含prompt的批次数据
-            loss_scale: 损失缩放因子（用于梯度累积归一化）
-
-        Returns:
-            该批次的损失值
-        """
-        # 准备批次数据
+        import time as _time
+        _t0 = _time.time()
         prompts_batch = {
             k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
             for k, v in prompts_batch.items()
         }
 
-        # 阶段1: 采样（no_grad）- 获取轨迹
         trajectories = self.sample_from_student(
             prompts=prompts_batch,
             num_trajectories=self.args.opdttt.opd_num_trajectories,
         )
+        _t1 = _time.time()
 
         if not trajectories:
-
             return 0.0
 
         # 阶段2: 训练（保留梯度）
-        # 重新计算采样token的logprobs（不带 KV cache，避免位置偏移）
         for trajectory in trajectories:
             input_ids = trajectory["input_ids"]
             prompt_length = trajectory["prompt_length"]
 
-
-
             if input_ids.shape[1] <= prompt_length:
                 trajectory["student_logprobs_with_grad"] = None
-
                 continue
 
             input_ids = input_ids.to(self.device)
@@ -660,10 +707,8 @@ class OPDTTTTrainer:
                 sampled_ids_reshaped = sampled_ids.unsqueeze(-1)
                 student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
                 trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
-
             else:
                 min_len = min(sampled_logprobs.shape[1], sampled_ids.shape[1])
-
                 if min_len > 0:
                     sampled_logprobs = sampled_logprobs[:, :min_len, :]
                     sampled_ids_trimmed = input_ids[:, prompt_length:prompt_length + min_len]
@@ -675,7 +720,7 @@ class OPDTTTTrainer:
 
         # 2b. 计算教师logprobs（detach）
         teacher_logprobs_list = self.compute_teacher_logprobs_on_sampled(trajectories)
-
+        _t2 = _time.time()
 
 
         # 2c & 2d. 计算重要性采样损失（使用有梯度的学生logprobs）
@@ -691,6 +736,9 @@ class OPDTTTTrainer:
         loss = loss * self.parallel_state.dp_size * loss_scale
         with self.model_bwd_context:
             loss.backward()
+        _t3 = _time.time()
+        with open("/h3c/haoxiang/TTT-OPD/timing.log", "a") as _f:
+            _f.write(f"rank={self.args.train.local_rank} sampling={_t1-_t0:.1f}s student_fwd={_t2-_t1:.1f}s teacher+loss+bwd={_t3-_t2:.1f}s total={_t3-_t0:.1f}s seq_len={trajectories[0]['input_ids'].shape[1] if trajectories else 0}\n")
 
         return loss.item()
 
@@ -716,20 +764,14 @@ class OPDTTTTrainer:
             if teacher_logprobs is None:
                 continue
 
-            # 使用重新计算的、带梯度的学生logprobs
             student_logprobs = trajectory.get("student_logprobs_with_grad")
 
             if student_logprobs is None or teacher_logprobs is None:
                 continue
 
-            # student_logprobs可能为 [1, sampled_length] 或 [sampled_length]
-            # teacher_logprobs形状: [1, sampled_length]
-
-            # 确保 student_logprobs 为 1D
             if student_logprobs.dim() == 2:
                 student_logprobs = student_logprobs[0]
 
-            # 对齐维度
             seq_len_s = student_logprobs.shape[0]
             seq_len_t = teacher_logprobs.shape[-1]
             min_len = min(seq_len_s, seq_len_t)
@@ -739,19 +781,11 @@ class OPDTTTTrainer:
             student_logprobs = student_logprobs[:min_len]
             teacher_logprobs = teacher_logprobs[0, :min_len]
 
-            # 计算reverse KL作为advantage（必须detach）
-            # reverse_KL = student_logprob - teacher_logprob
-            # advantage = -reverse_KL = teacher_logprob - student_logprob
             reverse_kl = (student_logprobs.detach() - teacher_logprobs.detach())
             advantages = -reverse_kl
 
-            # 重要性采样权重（分子保留梯度，分母detach）
-            # rho = exp(student_logprob - student_logprob.detach())
-            # 在OPD中theta_old=theta，所以rho数值上=1，但梯度保留
             rho = torch.exp(student_logprobs - student_logprobs.detach())
 
-            # 重要性采样策略梯度损失
-            # loss = -rho * advantage
             loss_per_token = -rho * advantages
 
             total_loss += loss_per_token.sum()
@@ -905,8 +939,6 @@ class OPDTTTTrainer:
                 # 处理小批量
                 total_loss = 0.0
                 if enable_opd:
-                    # OPD模式：从学生采样并使用重要性采样
-                    # 需要按 micro-batch 数量归一化梯度，使累积梯度等于全局平均
                     num_micro_batches = len(micro_batches)
                     for micro_batch in micro_batches:
                         loss = self.train_step_opd(
