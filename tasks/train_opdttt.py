@@ -210,6 +210,16 @@ class OPDTTTArguments:
         metadata={"help": "OPD数据集中的prompt字段名"},
     )
 
+    # 检查点策略
+    keep_all_checkpoints: bool = field(
+        default=True,
+        metadata={"help": "True=保留所有checkpoint，False=只保留最新的（删除旧的）"},
+    )
+    save_best: bool = field(
+        default=True,
+        metadata={"help": "保存loss最低的checkpoint为best"},
+    )
+
 
 @dataclass
 class Arguments:
@@ -402,15 +412,48 @@ class OPDTTTTrainer:
         prompt_lens = []
         prompt_list = []
         for batch_idx in range(batch_size):
-            if labels is not None:
-                actual_prompt_len = (labels[batch_idx] != -100).sum().item()
+            row_ids = input_ids[batch_idx]  # [seq_len]
+            row_labels = labels[batch_idx] if labels is not None else None
+
+            if row_labels is not None:
+                # Packed sequence: split by IGNORE_INDEX (-100) boundary markers
+                # -100 appears at the first token of each sub-prompt (except the first)
+                # and at padding positions. Find actual packed length and boundaries.
+                non_ignore = (row_labels != -100).nonzero(as_tuple=True)[0]
+                if len(non_ignore) == 0:
+                    continue
+                packed_len = non_ignore[-1].item() + 1
+
+                # Find boundary positions within packed region
+                boundary_positions = []
+                for i in range(1, packed_len):
+                    if row_labels[i].item() == -100:
+                        boundary_positions.append(i)
+
+                if not boundary_positions:
+                    # Single prompt (no packing)
+                    p_ids = row_ids[:packed_len].unsqueeze(0)
+                else:
+                    # Multiple prompts: split at boundaries
+                    boundaries = [0] + boundary_positions + [packed_len]
+                    for bi in range(len(boundaries) - 1):
+                        start = boundaries[bi]
+                        end = boundaries[bi + 1]
+                        p = row_ids[start:end]
+                        if len(p) > 0:
+                            prompt_list.append(p)
+                            plen = p.shape[0]
+                            if plen > 1 and p[-1].item() == eos_token_id:
+                                p = p[:-1]
+                                plen = p.shape[0]
+                            prompt_lens.append(plen)
+                    continue
             else:
-                actual_prompt_len = input_ids.shape[1]
-            p_ids = input_ids[batch_idx:batch_idx+1, :actual_prompt_len]
+                p_ids = row_ids.unsqueeze(0)
+
             if p_ids.shape[1] > 1 and p_ids[0, -1].item() == eos_token_id:
                 p_ids = p_ids[:, :-1]
-                actual_prompt_len = p_ids.shape[1]
-            prompt_lens.append(actual_prompt_len)
+            prompt_lens.append(p_ids.shape[1])
             prompt_list.append(p_ids.squeeze(0))
 
         for i in range(num_trajectories):
@@ -601,7 +644,20 @@ class OPDTTTTrainer:
                     sampled_tokens_reshaped = sampled_tokens_reshaped[:, :min_len, :]
 
                 teacher_logprobs_on_sampled = teacher_logprobs.gather(-1, sampled_tokens_reshaped).squeeze(-1)
-                teacher_logprobs_list.append(teacher_logprobs_on_sampled)
+
+                # Pre-compute top-K teacher logits for KL (avoids storing full logits)
+                K_KL = 100
+                student_vocab = self.student_model.config.vocab_size
+                t_logits_for_topk = sampled_logits[0]  # [seq, teacher_vocab]
+                if t_logits_for_topk.shape[-1] > student_vocab:
+                    t_logits_for_topk = t_logits_for_topk[..., :student_vocab]
+                t_topk_vals, t_topk_idx = t_logits_for_topk.float().topk(K_KL, dim=-1)  # [seq, K]
+
+                teacher_logprobs_list.append({
+                    "on_sampled": teacher_logprobs_on_sampled,
+                    "t_topk_vals": t_topk_vals,   # [seq, K] float32, tiny
+                    "t_topk_idx": t_topk_idx,     # [seq, K] int64, tiny
+                })
 
         return teacher_logprobs_list
 
@@ -678,55 +734,87 @@ class OPDTTTTrainer:
         )
         _t1 = _time.time()
 
+        # 同步trajectory数量：FSDP2 student forward涉及all-gather，
+        # 不同rank的trajectory数量必须一致，否则死锁
+        num_trajs = torch.tensor([len(trajectories)], device=self.device)
+        all_reduce(num_trajs, op="min", group=self.parallel_state.fsdp_group)
+        min_trajs = int(num_trajs.item())
+        trajectories = trajectories[:min_trajs]
+
         if not trajectories:
             return 0.0
 
         # 阶段2: 训练（保留梯度）
+        # 筛选valid trajectories（有采样token的），做单次batched FSDP2 forward
+        # 所有rank做相同的1次forward+1次backward，避免collective不匹配导致死锁
+        valid_trajs = []
         for trajectory in trajectories:
             input_ids = trajectory["input_ids"]
             prompt_length = trajectory["prompt_length"]
-
-            if input_ids.shape[1] <= prompt_length:
+            if input_ids.shape[1] > prompt_length:
+                valid_trajs.append(trajectory)
+            else:
                 trajectory["student_logprobs_with_grad"] = None
-                continue
 
-            input_ids = input_ids.to(self.device)
+        # 同步valid数量，确保所有rank要么都做forward，要么都不做
+        valid_count_t = torch.tensor([len(valid_trajs) > 0], device=self.device)
+        all_reduce(valid_count_t, op="min", group=self.parallel_state.fsdp_group)
+        has_valid = bool(valid_count_t.item())
+
+        if has_valid and valid_trajs:
+            # Pad all valid trajectories to max length for single batched forward
+            max_seq = max(t["input_ids"].shape[1] for t in valid_trajs)
+            pad_id = self.tokenizer.pad_token_id
+            batch_ids = torch.full((len(valid_trajs), max_seq), pad_id,
+                                   dtype=torch.long, device=self.device)
+            for bi, t in enumerate(valid_trajs):
+                ids = t["input_ids"].to(self.device)
+                if ids.dim() == 1:
+                    ids = ids.unsqueeze(0)
+                seq_len = ids.shape[1]
+                batch_ids[bi, :seq_len] = ids[0]
 
             outputs = self.student_model(
-                input_ids=input_ids,
-                attention_mask=torch.ones(input_ids.shape, dtype=torch.float32, device=input_ids.device),
+                input_ids=batch_ids,
+                attention_mask=torch.ones(batch_ids.shape, dtype=torch.float32, device=self.device),
                 use_cache=False,
             )
 
-            sampled_logits = outputs.logits[:, prompt_length-1:-1, :]
-            sampled_logprobs = F.log_softmax(sampled_logits, dim=-1)
+            for bi, trajectory in enumerate(valid_trajs):
+                input_ids = trajectory["input_ids"].to(self.device)
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                prompt_length = trajectory["prompt_length"]
+                seq_len = input_ids.shape[1]
 
-            sampled_ids = input_ids[:, prompt_length:]
+                sampled_logits = outputs.logits[bi, prompt_length-1:seq_len-1, :]
+                sampled_logprobs = F.log_softmax(sampled_logits, dim=-1)
+                sampled_ids = input_ids[0, prompt_length:]
 
-            if sampled_ids.shape[1] > 0 and sampled_logprobs.shape[1] == sampled_ids.shape[1]:
-                sampled_ids_reshaped = sampled_ids.unsqueeze(-1)
-                student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
-                trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
-            else:
-                min_len = min(sampled_logprobs.shape[1], sampled_ids.shape[1])
+                min_len = min(sampled_logprobs.shape[0], sampled_ids.shape[0])
                 if min_len > 0:
-                    sampled_logprobs = sampled_logprobs[:, :min_len, :]
-                    sampled_ids_trimmed = input_ids[:, prompt_length:prompt_length + min_len]
-                    sampled_ids_reshaped = sampled_ids_trimmed.unsqueeze(-1)
-                    student_logprobs_with_grad = sampled_logprobs.gather(-1, sampled_ids_reshaped).squeeze(-1)
+                    student_logprobs_with_grad = sampled_logprobs[:min_len].gather(-1, sampled_ids[:min_len].unsqueeze(-1)).squeeze(-1)
                     trajectory["student_logprobs_with_grad"] = student_logprobs_with_grad
+                    trajectory["student_bi"] = bi
+                    trajectory["student_logits_start"] = prompt_length - 1
+                    trajectory["student_logits_len"] = min_len
                 else:
                     trajectory["student_logprobs_with_grad"] = None
+                    trajectory["student_bi"] = None
+        else:
+            for trajectory in valid_trajs:
+                trajectory["student_logprobs_with_grad"] = None
 
         # 2b. 计算教师logprobs（detach）
         teacher_logprobs_list = self.compute_teacher_logprobs_on_sampled(trajectories)
         _t2 = _time.time()
 
 
-        # 2c & 2d. 计算重要性采样损失（使用有梯度的学生logprobs）
+        # 2c & 2d. 计算重要性采样损失 + forward KL（使用有梯度的学生logprobs）
         loss = self.compute_importance_sampling_loss_with_grad(
             trajectories,
             teacher_logprobs_list,
+            outputs.logits if (has_valid and valid_trajs) else None,
         )
 
 
@@ -745,24 +833,36 @@ class OPDTTTTrainer:
     def compute_importance_sampling_loss_with_grad(
         self,
         trajectories: List[Dict[str, torch.Tensor]],
-        teacher_logprobs_list: List[torch.Tensor],
+        teacher_logprobs_list: List,
+        student_logits_batch: torch.Tensor = None,
     ) -> torch.Tensor:
         """
-        计算重要性采样损失（使用重新计算的、带梯度的logprobs）
+        计算重要性采样损失 + forward KL正则化
+
+        forward KL(teacher||student) 防止模式崩溃：
+        - reverse KL (on sampled tokens) 只在学生采样的token上学习 → 模式崩溃
+        - forward KL (full vocab) 强制学生完整分布向教师对齐 → 防止崩溃
 
         Args:
-            trajectories: 学生采样轨迹（包含重新计算的logprobs）
-            teacher_logprobs_list: 教师在采样token上的logprobs
+            trajectories: 学生采样轨迹
+            teacher_logprobs_list: 教师信息（on_sampled logprobs + full_logits）
+            student_logits_batch: 学生的batched logits引用（避免复制）
 
         Returns:
-            重要性采样损失
+            组合损失
         """
-        total_loss = 0.0
+        total_is_loss = 0.0
+        total_kl_loss = 0.0
         total_tokens = 0
 
-        for trajectory, teacher_logprobs in zip(trajectories, teacher_logprobs_list):
-            if teacher_logprobs is None:
+        lambda_kl = float(self.args.opdttt.lambda_kl)
+
+        for trajectory, teacher_info in zip(trajectories, teacher_logprobs_list):
+            if teacher_info is None:
                 continue
+
+            teacher_logprobs = teacher_info["on_sampled"]
+            teacher_full_logits = teacher_info.get("full_logits")
 
             student_logprobs = trajectory.get("student_logprobs_with_grad")
 
@@ -787,12 +887,44 @@ class OPDTTTTrainer:
             rho = torch.exp(student_logprobs - student_logprobs.detach())
 
             loss_per_token = -rho * advantages
+            loss_per_token = torch.nan_to_num(loss_per_token, nan=0.0, posinf=0.0, neginf=0.0)
 
-            total_loss += loss_per_token.sum()
+            total_is_loss += loss_per_token.sum()
             total_tokens += min_len
 
+            # Forward KL (top-K近似): KL(teacher || student) ≈ sum over top-K teacher tokens
+            # 使用预计算的teacher top-K，只从student logits gather K个值
+            if lambda_kl > 0 and student_logits_batch is not None:
+                t_topk_vals = teacher_info.get("t_topk_vals")
+                t_topk_idx = teacher_info.get("t_topk_idx")
+                bi = trajectory.get("student_bi")
+                start = trajectory.get("student_logits_start")
+                slogits_len = trajectory.get("student_logits_len")
+                if all(x is not None for x in [t_topk_vals, t_topk_idx, bi, start, slogits_len]):
+                    kl_min_len = min(slogits_len, t_topk_vals.shape[0])
+                    if kl_min_len > 0:
+                        # Gather student logits at top-K positions (bfloat16 → float32, minimal memory)
+                        s_topk = student_logits_batch[bi, start:start+kl_min_len, :].gather(
+                            -1, t_topk_idx[:kl_min_len]
+                        ).float()  # [kl_min_len, K]
+
+                        t_vals = t_topk_vals[:kl_min_len]  # [kl_min_len, K]
+
+                        t_topk_probs = F.softmax(t_vals, dim=-1)
+                        t_topk_log_probs = F.log_softmax(t_vals, dim=-1)
+                        s_topk_log_probs = F.log_softmax(s_topk, dim=-1)
+
+                        kl_per_token = (t_topk_probs * (t_topk_log_probs - s_topk_log_probs)).sum(dim=-1)
+                        kl_per_token = torch.nan_to_num(kl_per_token, nan=0.0, posinf=0.0, neginf=0.0)
+
+                        total_kl_loss += kl_per_token.sum()
+
+                        del s_topk, t_vals, t_topk_probs, t_topk_log_probs, s_topk_log_probs, kl_per_token
+
         if total_tokens > 0:
-            return total_loss / total_tokens
+            is_loss = total_is_loss / total_tokens
+            kl_loss = total_kl_loss / total_tokens if total_tokens > 0 else torch.tensor(0.0, device=self.device)
+            return is_loss + lambda_kl * kl_loss
         else:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
 
@@ -882,6 +1014,8 @@ class OPDTTTTrainer:
         """
         global_step = start_step
         last_ckpt_path = None
+        best_loss = float('inf')
+        best_ckpt_path = None
 
         self.student_model.train()
         if self.teacher_model is not None:
@@ -999,6 +1133,12 @@ class OPDTTTTrainer:
                 ):
                     last_ckpt_path = self._save_checkpoint(global_step, last_ckpt_path)
 
+                    # Best checkpoint: loss最低时复制为best
+                    if self.args.opdttt.save_best and total_loss < best_loss:
+                        best_loss = total_loss
+                        if self.args.train.global_rank == 0:
+                            best_ckpt_path = self._save_best_checkpoint(global_step, last_ckpt_path, best_ckpt_path)
+
             start_step = 0
 
         # 最终检查点
@@ -1029,12 +1169,23 @@ class OPDTTTTrainer:
         actual_ckpt_path = os.path.join(save_path, f"global_step_{global_step}")
         logger.info(f"检查点已保存: {actual_ckpt_path}")
 
-        # 轮转旧检查点
-        if last_ckpt_path is not None and os.path.isdir(last_ckpt_path):
-            shutil.rmtree(last_ckpt_path, ignore_errors=True)
-            logger.info(f"删除旧检查点: {last_ckpt_path}")
+        # 轮转旧检查点（仅在 keep_all_checkpoints=False 时）
+        if not self.args.opdttt.keep_all_checkpoints:
+            if last_ckpt_path is not None and os.path.isdir(last_ckpt_path):
+                shutil.rmtree(last_ckpt_path, ignore_errors=True)
+                logger.info(f"删除旧检查点: {last_ckpt_path}")
 
         return actual_ckpt_path
+
+    def _save_best_checkpoint(self, global_step: int, src_ckpt_path: str, prev_best_path: Optional[str]):
+        """将当前checkpoint复制为best（仅rank0执行文件操作）"""
+        import shutil as _shutil
+        best_path = os.path.join(self.args.train.save_checkpoint_path, "best")
+        if os.path.isdir(best_path):
+            _shutil.rmtree(best_path, ignore_errors=True)
+        _shutil.copytree(src_ckpt_path, best_path)
+        logger.info(f"Best checkpoint已更新 (step={global_step}): {best_path}")
+        return best_path
 
     def _save_hf_weights(self, global_step: int, last_ckpt_path: Optional[str]):
         """保存 HuggingFace 格式权重"""
@@ -1181,17 +1332,15 @@ def main():
         args.data.train_size / (args.train.global_batch_size * args.data.max_seq_len)
     )
 
-    # OPD模式：禁用动态打包，每个micro_batch是一个单独的prompt
+    # OPD模式：使用pad_to_length=max_seq_len避免crash，在sample_from_student中拆分packed序列
     # 标准模式：使用动态打包填充到max_seq_len
     if args.opdttt.enable_opd_sampling:
-        opd_pad_to_length = min(2048, args.data.max_seq_len)
         collate_fn_kwargs = {
-            "pad_to_length": opd_pad_to_length,
+            "pad_to_length": args.data.max_seq_len,
         }
         use_dyn_bsz = False
-        # dyn_bsz=False时，dataloader_batch_size = global_batch_size / dp_size
         opd_dataloader_batch_size = args.train.global_batch_size // args.train.data_parallel_size
-        logger.info_rank0(f"OPD模式: dyn_bsz=False, pad_to_length={opd_pad_to_length}, dataloader_batch_size={opd_dataloader_batch_size}")
+        logger.info_rank0(f"OPD模式: pad_to_length={args.data.max_seq_len}, dataloader_batch_size={opd_dataloader_batch_size}")
     else:
         collate_fn_kwargs = {
             "pad_to_length": args.data.max_seq_len,

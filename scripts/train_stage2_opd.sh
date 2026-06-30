@@ -99,7 +99,7 @@ fi
 echo "使用 $NUM_GPUS 个 GPU" | tee -a "$LOG_FILE"
 
 # 启动训练，输出到日志文件（配置文件作为位置参数）
-torchrun \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=1200 torchrun \
     --nproc_per_node=$NUM_GPUS \
     --master_port=29500 \
     tasks/train_opdttt.py \
