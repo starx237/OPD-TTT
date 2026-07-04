@@ -32,8 +32,8 @@ AutoConfig.register("llama", LlamaConfig, exist_ok=True)
 AutoModel.register(LlamaConfig, LlamaModel, exist_ok=True)
 AutoModelForCausalLM.register(LlamaConfig, LlamaForCausalLM, exist_ok=True)
 
-# 注册 OPD-TTT 模型（使用 llama config 类型以保持兼容性）
-AutoModelForCausalLM.register(LlamaConfig, OPDTTTForCausalLM, exist_ok=True)
+# OPDTTTForCausalLM 不注册到 AutoModelForCausalLM，避免覆盖 LlamaForCausalLM
+# 需要 OPD-TTT 的脚本应显式 import OPDTTTForCausalLM
 
 # 注意：liger_kernel LCE 前向传播已禁用，因为 Triton/CUDA 驱动不兼容
 # 在此系统上（CUDA Driver 470.x）。改用标准前向传播。

@@ -186,6 +186,7 @@ class LlamaConfig(PretrainedConfig):
         attention_dropout=0.0,
         mlp_bias=False,
         head_dim=None,
+        sliding_window=None,
         # TTT-related parameters
         ttt_layers=[0, 6, 12, 18, 24, 30],
         ttt_mode=True,
@@ -228,6 +229,7 @@ class LlamaConfig(PretrainedConfig):
         self.attention_dropout = attention_dropout
         self.mlp_bias = mlp_bias
         self.head_dim = head_dim if head_dim is not None else self.hidden_size // self.num_attention_heads
+        self.sliding_window = sliding_window
         # TTT settings
         self.ttt_layers = ttt_layers
         self.ttt_mode = ttt_mode

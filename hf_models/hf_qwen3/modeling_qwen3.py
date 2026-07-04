@@ -516,6 +516,16 @@ class Qwen3Model(Qwen3PreTrainedModel):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
+            # For flash_attention_2, skip the padding mask to avoid the varlen path.
+            # flash_attn handles causality and sliding_window natively; padding tokens
+            # are ignored in the loss (labels=-100), so attending to them is harmless.
+            # Also rebuild position_ids as a simple increasing sequence to avoid
+            # _is_packed_sequence detecting padding (position_ids=0 for pad tokens)
+            # and triggering the varlen backward path (which crashes at 32K+ seq).
+            if self.config._attn_implementation == "flash_attention_2":
+                attention_mask = None
+                position_ids = cache_position.unsqueeze(0)
+
             # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,

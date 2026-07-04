@@ -7,7 +7,7 @@ OPD-TTT 模块：教师引导的测试时训练增强组件
 将 In-Place TTT 与教师模型指导相结合。
 
 主要组件：
-1. OPDTTTMLP：教师引导的 MLP 层，支持快速权重更新
+1. OPDQwen3MLP：教师引导的 MLP 层，支持快速权重更新
 2. OPDTTTLoss：四层损失函数（NTP对齐、教师表示对齐、KL散度、语言建模）
 3. compute_teacher_repr_targets：计算教师表示目标
 
@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .configuration_llama import LlamaConfig
+from .configuration_qwen3 import Qwen3Config
 
 
 def pca_init_projection(
@@ -86,7 +86,7 @@ def pca_init_projection(
     return projection  # [target_dim, teacher_hidden_size]
 
 
-class OPDTTTMLP(nn.Module):
+class OPDQwen3MLP(nn.Module):
     """
     OPD-TTT 增强的 MLP 层
 
@@ -116,9 +116,9 @@ class OPDTTTMLP(nn.Module):
         self.teacher_hidden_size = getattr(config, "teacher_hidden_size", self.hidden_size)
 
         # 标准的 SwiGLU MLP 结构
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=config.mlp_bias)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
         # 获取激活函数
         from transformers.activations import ACT2FN
@@ -710,7 +710,7 @@ def compute_teacher_repr_targets(
 
 
 __all__ = [
-    "OPDTTTMLP",
+    "OPDQwen3MLP",
     "OPDTTTLoss",
     "TeacherCache",
     "compute_teacher_repr_targets",

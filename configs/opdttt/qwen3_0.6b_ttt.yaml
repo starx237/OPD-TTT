@@ -1,0 +1,95 @@
+# Qwen3-0.6B + In-Place TTT 持续预训练
+#
+# 基于官方 In-Place-TTT 的 qwen3_longct.yaml 适配
+# 论文配置参考：
+#   - ttt_layers: 每6层（28层→[0,6,12,18,24]）
+#   - ttt_lr: 3, ttt_chunk: 4096（官方 continual 推荐）
+#   - ttt_target: hidden_states（持续训练用）
+#   - sliding_window: 2048（论文500M配置，Qwen3原生支持SWA）
+#   - ttt_max_norm: 0（不裁剪，与官方训练模型一致）
+#   - lr: 5e-6（官方 continual 推荐）
+
+# ========== 模型配置 ==========
+model:
+  model_path: model_assets/.cache/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+  tokenizer_path: model_assets/.cache/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca
+  attn_implementation: flash_attention_2
+
+# ========== 数据配置 ==========
+data:
+  data_dir: data
+  train_path: data/piles_packed_32768_shuffled.jsonl
+  train_size: 20000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 32768
+  text_keys: content_split
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/qwen3_0.6b_ttt
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 60
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: qwen3-0.6b-ttt-continual
+  max_steps: 5000
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  dyn_bsz: false
+  optimizer: adamw
+  lr: 5.0e-6
+  lr_warmup_ratio: 0.02
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  empty_cache_steps: 10
+  seed: 42
+
+  checkpoint:
+    output_dir: data/output/qwen3_0.6b_ttt
+    manager: dcp
+    save_steps: 200
+    save_hf_weights: true
+    load_path: "data/output/qwen3_0.6b_ttt/checkpoints/global_step_1200/global_step_1200"
+
+# ========== OPD-TTT 配置 ==========
+opdttt:
+  model_type: qwen3
+  sliding_window: 2048
+
+  # 无教师（纯TTT持续预训练）
+  teacher_model_path: ""
+
+  # TTT层配置
+  opdttt_layers: [0, 6, 12, 18, 24]
+  ttt_lr: 3
+  ttt_chunk: 4096
+  ttt_proj: true
+  ttt_max_norm: 0
+
+  # 损失权重（纯CE）
+  lambda_ntp: 1.0
+  lambda_align_rep: 0.0
+  lambda_kl: 0.0
+  lambda_lm: 1.0
+
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"
+
+  # 检查点策略
+  keep_all_checkpoints: true   # 保留所有checkpoint，不删除旧的
+  save_best: true              # 保存loss最低的checkpoint为best

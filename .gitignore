@@ -156,6 +156,7 @@ nsysoutput/
 veomni_cli.yaml
 demo.parquet
 tmp
+tmp_save/
 models
 gpu.py
 vscode.sh

@@ -1,0 +1,96 @@
+# 阶段1.5：在现有 stage1 存档点上继续训练，开启 TTT + SWA
+#
+# 背景：stage1 存档点训练时 ttt_max_norm=1e-5（TTT被禁用）且无SWA（全注意力）。
+# 本配置在已有权重基础上继续训练：
+#   1. 启用真正的 TTT（max_norm=0）
+#   2. 启用 SWA（sliding_window=2048，与论文一致）
+#   3. 模型需要适应从全注意力到SWA的转变
+#
+# 关键修改：
+#   1. ttt_max_norm: 0（不裁剪，启用真正的 TTT）
+#   2. sliding_window: 2048（论文500M配置）
+#   3. lr: 1e-4（比 stage1 的 5e-4 低，避免破坏已学到的权重）
+#   4. max_steps: 2000（少量步数让模型适应SWA+TTT）
+#
+# 使用前需要先迁移存档点参数名：
+#   python scripts/migrate_checkpoint.py \
+#     --input data/output/500m_stage1_pretrain/checkpoints/global_step_9500/hf_ckpt \
+#     --output model_assets/500m_stage1_migrated \
+#     --reinit-ttt
+
+# ========== 模型配置 ==========
+model:
+  model_path: model_assets/500m_stage1_migrated
+  tokenizer_path: model_assets/tokenizer
+  vocab_size: 151665
+  foundation:
+    sliding_window: 2048       # SWA窗口大小（论文500M配置）
+
+# ========== 数据配置 ==========
+data:
+  data_dir: data
+  train_path: data/piles_packed_32768_shuffled.jsonl
+  train_size: 20000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 32768
+  text_keys: content_split
+  drop_last: false
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/500m_stage1_5_ttt
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 66
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: 500m-stage1.5-ttt-continue
+  max_steps: 2000
+  optimizer: adamw
+  lr: 1.0e-4
+  lr_warmup_ratio: 0.05
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  lr_min: 1.0e-6
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false
+  init_device: meta
+  empty_cache_steps: 10
+  seed: 42
+
+  checkpoint:
+    output_dir: data/output/500m_stage1_5_ttt
+    manager: dcp
+    save_steps: 200
+    save_hf_weights: true
+    load_path: ""
+
+# ========== OPD-TTT配置 ==========
+opdttt:
+  teacher_model_path: ""
+
+  # TTT层配置（与stage1相同）
+  opdttt_layers: [0, 6, 12, 18]
+  ttt_lr: 3
+  ttt_chunk: 1024
+  ttt_proj: true
+  ttt_max_norm: 0          # 不裁剪！启用真正的 TTT
+
+  # 损失权重（纯CE，无教师）
+  lambda_ntp: 1.0
+  lambda_align_rep: 0.0
+  lambda_kl: 0.0
+  lambda_lm: 1.0
+
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"

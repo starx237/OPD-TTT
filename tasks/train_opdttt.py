@@ -119,6 +119,16 @@ class OPDTTTArguments:
     OPD-TTT 训练的额外参数
     """
 
+    # 模型类型
+    model_type: str = field(
+        default="llama",
+        metadata={"help": "模型类型: llama 或 qwen3"},
+    )
+    sliding_window: int = field(
+        default=0,
+        metadata={"help": "SWA窗口大小（0=不启用，论文500M=2048）"},
+    )
+
     # 教师模型配置
     teacher_model_path: str = field(
         default="", metadata={"help": "教师模型检查点路径"}
@@ -228,6 +238,16 @@ class Arguments:
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
     opdttt: "OPDTTTArguments" = field(default_factory=OPDTTTArguments)
+
+
+def _get_model_class(model_type: str = "llama"):
+    """根据 model_type 返回对应的 OPD-TTT 模型类"""
+    if model_type == "qwen3":
+        from hf_models.hf_qwen3 import OPDQwen3ForCausalLM
+        return OPDQwen3ForCausalLM
+    else:
+        from hf_models.hf_llama import OPDTTTForCausalLM
+        return OPDTTTForCausalLM
 
 
 class OPDTTTTrainer:
@@ -351,19 +371,19 @@ class OPDTTTTrainer:
     def _build_sampling_model(self):
         if hasattr(self, '_sampling_model') and self._sampling_model is not None:
             return self._sampling_model
-        from hf_models.hf_llama import OPDTTTForCausalLM
+        ModelClass = _get_model_class(self.args.opdttt.model_type)
         config_path = self.args.model.config_path or self.args.model.model_path
         model_path = self.args.model.model_path
 
         if model_path and os.path.isdir(model_path):
-            sampling_model = OPDTTTForCausalLM.from_pretrained(
+            sampling_model = ModelClass.from_pretrained(
                 model_path,
                 config=AutoConfig.from_pretrained(config_path),
                 torch_dtype=torch.bfloat16,
                 ignore_mismatched_sizes=True,
             )
         else:
-            sampling_model = OPDTTTForCausalLM.from_pretrained(
+            sampling_model = ModelClass.from_pretrained(
                 config_path,
                 torch_dtype=torch.bfloat16,
                 ignore_mismatched_sizes=True,
@@ -1141,9 +1161,11 @@ class OPDTTTTrainer:
 
             start_step = 0
 
-        # 最终检查点
-        if self.args.train.global_rank == 0:
+        # 最终检查点：所有rank参与DCP加载（集合操作），仅rank0保存HF权重
+        if last_ckpt_path is not None:
             self._save_hf_weights(global_step, last_ckpt_path)
+        else:
+            logger.info_rank0("跳过HF权重保存：无DCP检查点可用")
 
     def _save_checkpoint(self, global_step: int, last_ckpt_path: Optional[str]):
         """保存分布式检查点"""
@@ -1188,7 +1210,10 @@ class OPDTTTTrainer:
         return best_path
 
     def _save_hf_weights(self, global_step: int, last_ckpt_path: Optional[str]):
-        """保存 HuggingFace 格式权重"""
+        """保存 HuggingFace 格式权重
+
+        所有rank参与DCP加载（dcp.load是集合操作），仅rank0保存safetensors。
+        """
         save_path = os.path.join(
             self.args.train.save_checkpoint_path, f"global_step_{global_step}", "hf_ckpt"
         )
@@ -1197,14 +1222,20 @@ class OPDTTTTrainer:
         # 因为ckpt_to_state_dict会聚合所有分片参数到一起
         helper.empty_cache()
         synchronize()
+        dist.barrier()
 
+        # 所有rank参与DCP加载（dcp.load是集合操作）
         model_state_dict = ckpt_to_state_dict(
             save_checkpoint_path=last_ckpt_path,
             ckpt_manager=self.args.train.ckpt_manager,
         )
 
-        save_model_weights(save_path, model_state_dict, model_assets=[self.model_config] if self.model_config else None)
-        logger.info(f"HuggingFace 权重已保存: {save_path}")
+        # 仅rank0保存safetensors文件
+        if self.args.train.global_rank == 0:
+            save_model_weights(save_path, model_state_dict, model_assets=[self.model_config] if self.model_config else None)
+            logger.info(f"HuggingFace 权重已保存: {save_path}")
+
+        dist.barrier()
 
 
 def build_teacher_model(
@@ -1366,7 +1397,8 @@ def main():
 
     # 构建学生模型
     logger.info_rank0("构建学生模型")
-    from hf_models.hf_llama import OPDTTTForCausalLM
+    ModelClass = _get_model_class(args.opdttt.model_type)
+    logger.info_rank0(f"模型类型: {args.opdttt.model_type}, 类: {ModelClass.__name__}")
 
     config_path = args.model.config_path or args.model.model_path
     config = AutoConfig.from_pretrained(config_path)
@@ -1382,7 +1414,25 @@ def main():
     config.ttt_chunk = int(args.opdttt.ttt_chunk)
     config.ttt_proj = args.opdttt.ttt_proj
     config.ttt_max_norm = float(args.opdttt.ttt_max_norm)
-    config.ttt_target = "input_embed"
+
+    # 模型类型特定配置
+    if args.opdttt.model_type == "qwen3":
+        config.ttt_target = "hidden_states"
+        config.ttt_mode = True
+        config.ttt_layers = args.opdttt.opdttt_layers
+        # Qwen3 SWA 配置
+        if args.opdttt.sliding_window > 0:
+            config.use_sliding_window = True
+            config.sliding_window = args.opdttt.sliding_window
+            config.layer_types = ["sliding_attention"] * config.num_hidden_layers
+            logger.info_rank0(f"Qwen3 SWA: sliding_window={args.opdttt.sliding_window}, all {config.num_hidden_layers} layers")
+        else:
+            config.layer_types = ["full_attention"] * config.num_hidden_layers
+    else:
+        config.ttt_target = "input_embed"
+        if args.opdttt.sliding_window > 0:
+            config.sliding_window = args.opdttt.sliding_window
+            logger.info_rank0(f"Llama SWA: sliding_window={args.opdttt.sliding_window}")
 
     # 新增：自适应权重和 PCA 初始化设置
     config.weight_adaptation = args.opdttt.weight_adaptation
@@ -1436,7 +1486,7 @@ def main():
 
         # 用 meta device 创建模型来获取期望的参数形状
         with torch.device("meta"):
-            meta_model = OPDTTTForCausalLM(config)
+            meta_model = ModelClass(config)
 
         expected_shapes = {
             name: param.shape for name, param in meta_model.named_parameters()
@@ -1483,7 +1533,7 @@ def main():
 
     if has_weights:
         logger.info_rank0(f"从预训练权重加载模型: {model_path}")
-        student_model = OPDTTTForCausalLM.from_pretrained(
+        student_model = ModelClass.from_pretrained(
             model_path,
             config=config,
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
@@ -1492,7 +1542,7 @@ def main():
         )
     else:
         logger.info_rank0(f"从配置初始化模型 (训练从开始): {config_path}")
-        student_model = OPDTTTForCausalLM._from_config(
+        student_model = ModelClass._from_config(
             config,
             torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
             attn_implementation=args.model.attn_implementation,
@@ -1599,7 +1649,25 @@ def main():
         checkpointer=checkpointer,
     )
 
-    trainer.train(train_steps=train_steps)
+    # 恢复训练：从DCP检查点加载模型、优化器、学习率调度器
+    start_step = 0
+    load_path = args.train.checkpoint.load_path.strip() if args.train.checkpoint.load_path else ""
+    if load_path:
+        logger.info_rank0(f"从检查点恢复训练: {load_path}")
+        load_state = {
+            "model": student_model,
+            "optimizer": optimizer,
+            "extra_state": {},
+        }
+        checkpointer.load(load_path, load_state)
+        extra_state = load_state.get("extra_state", {})
+        start_step = extra_state.get("global_step", 0)
+        if "lr_scheduler" in extra_state:
+            lr_scheduler.load_state_dict(extra_state["lr_scheduler"])
+        logger.info_rank0(f"恢复成功: start_step={start_step}")
+        dist.barrier()
+
+    trainer.train(train_steps=train_steps, start_step=start_step)
 
     # 清理
     synchronize()

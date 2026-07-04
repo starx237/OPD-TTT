@@ -88,46 +88,29 @@ def compute_sliding_window_ppl(
         for start_idx in range(0, seq_len - context_length + 1, stride):
             end_idx = start_idx + context_length
 
-            # 取窗口
+            # 取窗口（完整 context_length 个 token）
             window_ids = input_ids[start_idx:end_idx].to(device)
 
-            # 计算最后 target_length 个 token 的困惑度
-            # 标准做法：input 是前 n-1 个 token，target 是后 n 个 token（下一 token）
-            if target_length >= context_length:
-                # 如果 target_length >= context_length，使用整个窗口
-                input_ids_window = window_ids[:-1]  # context
-                target_ids_window = window_ids[1:]    # prediction targets
-            else:
-                # 否则只计算最后 target_length 个 token
-                # input: window[-(target_length+1):-1]
-                # target: window[-target_length:]
-                input_start = context_length - target_length - 1
-                if input_start < 0:
-                    input_start = 0
-                input_ids_window = window_ids[input_start:-1]
-                target_ids_window = window_ids[input_start+1:]
+            # 模型接收完整窗口的前 n-1 个 token，输出所有位置的 logits
+            input_ids_window = window_ids[:-1]   # [context_length-1] 作为输入
+            target_ids_window = window_ids[1:]   # [context_length-1] 作为目标
 
-            if input_ids_window.shape[0] == 0 or target_ids_window.shape[0] == 0:
+            if input_ids_window.shape[0] == 0:
                 continue
 
-            # 前向传播获取 logits
+            # 前向传播：模型看完整 context
             outputs = model(input_ids_window.unsqueeze(0))
-            logits = outputs.logits.squeeze(0)  # [seq_len, vocab_size]
+            logits = outputs.logits.squeeze(0)  # [context_length-1, vocab_size]
 
-            # 计算标准交叉熵损失
-            num_targets = target_ids_window.shape[0]
-            if logits.shape[0] < num_targets:
-                # 如果 logits 长度不够，调整目标数量
-                num_targets = logits.shape[0]
-                target_ids_window = target_ids_window[:num_targets]
-
+            # 只计算最后 target_length 个 token 的 loss
+            num_targets = min(target_length, logits.shape[0])
             if num_targets == 0:
                 continue
 
-            # 使用标准的交叉熵损失: CE(logits, target)
-            # logits shape: [num_targets, vocab_size]
-            # target shape: [num_targets]
-            loss = ce_loss_fn(logits[:num_targets], target_ids_window[:num_targets])
+            loss = ce_loss_fn(
+                logits[-num_targets:],
+                target_ids_window[-num_targets:]
+            )
 
             total_loss += loss.item()
             total_tokens += num_targets
@@ -143,12 +126,14 @@ def compute_sliding_window_ppl(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--tokenizer_path", type=str, default=None,
+                        help="Tokenizer路径（默认与model_path相同）")
     parser.add_argument("--output_path", type=str, required=True)
     parser.add_argument("--val_data_path", type=str, required=True)
     parser.add_argument("--context_lengths", type=str,
                         default="2048,4096,8192,16384,32768")
-    parser.add_argument("--stride", type=int, default=512,
-                        help="滑动窗口步长")
+    parser.add_argument("--stride", type=int, default=0,
+                        help="滑动窗口步长（0=自动设为context_length-target_length，避免target重叠）")
     parser.add_argument("--target_length", type=int, default=256,
                         help="每个窗口计算最后多少个 token 的困惑度")
     parser.add_argument("--num_samples", type=int, default=100)
@@ -163,10 +148,11 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
         trust_remote_code=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    ).to(device)
+    tok_path = args.tokenizer_path or args.model_path
+    print(f"加载tokenizer: {tok_path}")
+    tokenizer = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -174,29 +160,30 @@ def main():
     val_texts = load_val_texts(args.val_data_path, args.num_samples, args.min_length)
     print(f"加载了 {len(val_texts)} 条验证文本")
 
-    results = {"stride": args.stride, "target_length": args.target_length}
     per_ctx_results = {}
 
     for ctx_len in context_lengths:
+        # 自动stride：避免target区域重叠
+        stride = args.stride if args.stride > 0 else max(ctx_len - args.target_length, 1)
+        print(f"  stride={stride}")
         ppl = compute_sliding_window_ppl(
             model,
             tokenizer,
             val_texts,
             ctx_len,
-            args.stride,
+            stride,
             args.target_length,
             device,
         )
         per_ctx_results[str(ctx_len)] = ppl
         print(f"  Context {ctx_len}: PPL = {ppl:.4f}")
 
-    results["perplexities"] = per_ctx_results
-
+    # 输出flat dict格式（兼容plot_figure.py）
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     with open(args.output_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(per_ctx_results, f, indent=2)
     print(f"\n结果已保存至: {args.output_path}")
-    print(json.dumps(results, indent=2))
+    print(json.dumps(per_ctx_results, indent=2))
 
 
 if __name__ == "__main__":

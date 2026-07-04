@@ -1,18 +1,9 @@
 # coding=utf-8
-# -*- coding: utf-8 -*-
 """
-OPD-TTT 完整模型实现
+OPD-TTT Qwen3 完整模型实现
 
-本模块实现了完整的 OPD-TTT 学生模型，支持：
-1. 教师模型指导的前向传播
-2. 四层损失函数计算
-3. 分层表示对齐
-4. FSDP2 分布式训练支持
-
-主要组件：
-- OPDTTTModel：OPD-TTT 学生模型主体
-- OPDTTTDecoderLayer：支持教师引导的解码层
-- OPDTTTForCausalLM：完整的因果语言模型
+基于 Llama OPD-TTT 适配 Qwen3 架构（Qwen3Attention 含 q_norm/k_norm）。
+训练用 OPDQwen3ForCausalLM，推理用 inference_model/。
 """
 
 from typing import Optional, Tuple, Union, Dict, Any, List
@@ -22,68 +13,40 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_rope_utils import dynamic_rope_update
-from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
-from transformers.utils import (
-    auto_docstring,
-    can_return_tuple,
-    logging,
-)
+from transformers.masking_utils import create_causal_mask
+from transformers.utils import auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import check_model_inputs
+from transformers.modeling_layers import GradientCheckpointingLayer
 
-from .configuration_llama import LlamaConfig
-from .modeling_llama import (
-    LlamaRMSNorm,
-    LlamaRotaryEmbedding,
-    LlamaAttention,
+from .configuration_qwen3 import Qwen3Config
+from .modeling_qwen3 import (
+    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
+    Qwen3Attention,
     repeat_kv,
     rotate_half,
     apply_rotary_pos_emb,
 )
-from .modeling_llama_opdttt import (
-    OPDTTTMLP,
+from .modeling_qwen3_opdttt import (
+    OPDQwen3MLP,
     OPDTTTLoss,
     compute_teacher_repr_targets,
 )
-from transformers.modeling_layers import GradientCheckpointingLayer
 
 logger = logging.get_logger(__name__)
 
 
-class OPDTTTDecoderLayer(GradientCheckpointingLayer):
-    """
-    OPD-TTT 解码层
-
-    该层在标准 LLaMA 解码层的基础上，将 MLP 替换为支持教师引导的 OPDTTTMLP。
-    支持：
-    1. 标准的注意力计算
-    2. 教师引导的 MLP 前向传播
-    3. 损失计算和返回
-    4. Gradient Checkpointing 支持
-    """
-
-    def __init__(self, config: LlamaConfig, layer_idx: int):
-        """
-        初始化 OPD-TTT 解码层
-
-        Args:
-            config: 模型配置
-            layer_idx: 当前层索引
-        """
+class OPDQwen3DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
 
-        # 自注意力层
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.mlp = OPDQwen3MLP(config, layer_idx=layer_idx)
+        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # 使用 OPD-TTT 增强的 MLP
-        self.mlp = OPDTTTMLP(config, layer_idx=layer_idx)
-
-        # 层归一化
-        self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # 检查是否为 OPD-TTT 层
         self.is_opdttt_layer = getattr(config, "opdttt_mode", False) and layer_idx in getattr(
             config, "opdttt_layers", []
         )
@@ -101,29 +64,9 @@ class OPDTTTDecoderLayer(GradientCheckpointingLayer):
         teacher_repr: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, dict]:
-        """
-        解码层前向传播，支持教师表示
-
-        Args:
-            hidden_states: 输入隐藏状态 [batch, seq_len, hidden_size]
-            attention_mask: 注意力掩码
-            position_ids: 位置 ID
-            past_key_values: 过去的键值对（用于缓存）
-            use_cache: 是否使用缓存
-            cache_position: 缓存位置
-            position_embeddings: 旋转位置嵌入
-            target_states: NTP 目标状态（输入嵌入）
-            teacher_repr: 教师表示（用于对齐）
-
-        Returns:
-            hidden_states: 输出隐藏状态
-            loss_dict: MLP 层的损失字典
-        """
-        # 残差连接 + 输入层归一化
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        # 自注意力计算
         hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
@@ -136,76 +79,44 @@ class OPDTTTDecoderLayer(GradientCheckpointingLayer):
         )
         hidden_states = residual + hidden_states
 
-        # MLP 前向传播（带 OPD-TTT）
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
 
-        # 准备 NTP 目标状态
         if target_states is None and self.is_opdttt_layer:
             target_states = kwargs.get("inputs_embeds", hidden_states)
 
-        # 准备教师表示（如果这是 OPD-TTT 层）
         layer_teacher_repr = None
         if teacher_repr is not None and self.is_opdttt_layer:
-            # 提取当前层的教师表示
             layer_teacher_repr = teacher_repr.get(self.layer_idx)
 
-        # MLP 前向传播
         hidden_states, mlp_losses = self.mlp(
             hidden_states,
             t=target_states,
             teacher_repr=layer_teacher_repr,
         )
         hidden_states = residual + hidden_states
-
         return hidden_states, mlp_losses
 
 
-class OPDTTTModel(nn.Module):
-    """
-    OPD-TTT 学生模型
-
-    该模型实现了教师学生架构中的学生模型，支持：
-    1. 教师模型输出的处理和投影
-    2. 分层表示对齐
-    3. 完整的前向传播
-    """
-
-    def __init__(self, config: LlamaConfig):
-        """
-        初始化 OPD-TTT 模型
-
-        Args:
-            config: 模型配置
-        """
+class OPDQwen3Model(nn.Module):
+    def __init__(self, config: Qwen3Config):
         super().__init__()
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        # Token 嵌入层
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-
-        # OPD-TTT 解码层堆叠
         self.layers = nn.ModuleList(
-            [OPDTTTDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [OPDQwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-
-        # 最终层归一化
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # 旋转位置嵌入
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
-
-        # Gradient checkpointing 设置
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
-        # OPD-TTT 设置
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
         self.opdttt_mode = getattr(config, "opdttt_mode", False)
         self.ttt_target = getattr(config, "ttt_target", "input_embed")
 
-        # 损失函数
         if self.opdttt_mode:
             self.opdttt_loss = OPDTTTLoss(
                 lambda_kl=getattr(config, "lambda_kl", 0.1),
@@ -215,123 +126,66 @@ class OPDTTTModel(nn.Module):
                 vocab_size=config.vocab_size,
             )
 
-    def _resolve_ttt_target_states(
-        self,
-        inputs_embeds: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        获取 NTP 的目标状态
-
-        Args:
-            inputs_embeds: 输入嵌入
-
-        Returns:
-            目标状态（通常是输入嵌入本身）
-        """
+    def _resolve_ttt_target_states(self, inputs_embeds):
         if self.ttt_target == "input_embed":
             return inputs_embeds
         return None
 
-    def compute_ce_loss(
-        self,
-        logits: torch.Tensor,
-        labels: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        计算标准的交叉熵损失
-
-        Args:
-            logits: 模型输出 [batch, seq_len, vocab_size]
-            labels: 真实标签 [batch, seq_len]
-            attention_mask: 注意力掩码
-
-        Returns:
-            loss: 交叉熵损失
-        """
-        # 移位：预测下一个 token
+    def compute_ce_loss(self, logits, labels, attention_mask=None):
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
-
-        # 计算交叉熵损失
         loss_fct = nn.CrossEntropyLoss(reduction='none')
-        shift_logits_view = shift_logits.view(-1, self.config.vocab_size)
-        shift_labels_view = shift_labels.view(-1)
-
-        loss = loss_fct(shift_logits_view, shift_labels_view)
-
-        # 应用 attention mask
+        loss = loss_fct(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
         if attention_mask is not None:
-            # 移位 mask
-            shift_mask = attention_mask[..., 1:].contiguous()
-            shift_mask_view = shift_mask.view(-1)
-            loss = loss * shift_mask_view
-            loss = loss.sum() / shift_mask_view.sum()
+            shift_mask = attention_mask[..., 1:].contiguous().view(-1)
+            loss = loss * shift_mask
+            loss = loss.sum() / shift_mask.sum()
         else:
             loss = loss.mean()
-
         return loss
 
     @check_model_inputs()
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        teacher_outputs: Optional[Dict[str, torch.Tensor]] = None,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        cache_position=None,
+        use_cache=None,
+        teacher_outputs=None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        模型前向传播，支持教师输出
-
-        Args:
-            input_ids: 输入 Token ID [batch, seq_len]
-            attention_mask: 注意力掩码
-            position_ids: 位置 ID
-            past_key_values: 过去的键值对
-            inputs_embeds: 输入嵌入
-            cache_position: 缓存位置
-            use_cache: 是否使用缓存
-            teacher_outputs: 教师模型输出字典，包含：
-                - logits: 教师 logits [batch, seq_len, vocab_size]
-                - hidden_states: 每层的隐藏状态 [num_layers][batch, seq_len, hidden_size]
-                - embeddings: 教师输入嵌入 [batch, seq_len, hidden_size]
-
-        Returns:
-            last_hidden_state: 最终隐藏状态
-            loss_dict: 损失字典
-        """
-        # 输入验证
-        # 两个都为 None 或两个都不为 None 时抛出错误
+    ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("必须且只能指定 input_ids 或 inputs_embeds 之一")
 
-        # 获取输入嵌入
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
-        # 初始化缓存
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        # 计算缓存位置
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-        # 计算位置 ID
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # 创建因果掩码（支持滑动窗口注意力）
-        mask_kwargs = dict(
+        # For flash_attention_2, skip padding mask and rebuild position_ids to avoid
+        # the varlen path. flash_attn handles causality and sliding_window natively;
+        # padding tokens are ignored in the loss (labels=-100). Without this fix,
+        # padding (attention_mask with 0s, position_ids with 0s) triggers the varlen
+        # path in flash_attn, whose backward crashes at 32K+ sequences.
+        if self.config._attn_implementation == "flash_attention_2":
+            attention_mask = None
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -339,30 +193,19 @@ class OPDTTTModel(nn.Module):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
-        if self.config.sliding_window is not None:
-            causal_mask = create_sliding_window_causal_mask(**mask_kwargs)
-        else:
-            causal_mask = create_causal_mask(**mask_kwargs)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # 准备教师表示（如果提供）
         teacher_repr = None
         if teacher_outputs is not None and self.opdttt_mode:
             teacher_repr = self._prepare_teacher_repr(
-                teacher_outputs,
-                inputs_embeds.shape[1],
-                inputs_embeds.device,
+                teacher_outputs, inputs_embeds.shape[1], inputs_embeds.device
             )
 
-        # 收集所有层的 NTP/对齐损失
         all_ntp_losses = {}
-
-        # 获取 NTP 目标状态
         target_states = self._resolve_ttt_target_states(inputs_embeds)
 
-        # 逐层前向传播
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             hidden_states, layer_losses = decoder_layer(
                 hidden_states,
@@ -377,17 +220,13 @@ class OPDTTTModel(nn.Module):
                 inputs_embeds=inputs_embeds,
                 **kwargs,
             )
-
-            # 收集当前层的损失
             for key, value in layer_losses.items():
                 if key not in all_ntp_losses:
                     all_ntp_losses[key] = []
                 all_ntp_losses[key].append(value)
 
-        # 最终层归一化
         hidden_states = self.norm(hidden_states)
 
-        # 聚合所有层的损失
         aggregated_losses = {}
         for key, losses in all_ntp_losses.items():
             if losses:
@@ -395,35 +234,15 @@ class OPDTTTModel(nn.Module):
 
         return hidden_states, aggregated_losses
 
-    def _prepare_teacher_repr(
-        self,
-        teacher_outputs: Dict[str, torch.Tensor],
-        seq_len: int,
-        device: torch.device,
-    ) -> Dict[int, torch.Tensor]:
-        """
-        准备每层的教师表示
-
-        Args:
-            teacher_outputs: 教师模型输出
-            seq_len: 序列长度
-            device: 设备
-
-        Returns:
-            层索引到教师表示的映射
-        """
+    def _prepare_teacher_repr(self, teacher_outputs, seq_len, device):
         teacher_repr = {}
-
         teacher_hidden = teacher_outputs.get("hidden_states", [])
         teacher_logits = teacher_outputs.get("logits", None)
         teacher_embeddings = teacher_outputs.get("embeddings", None)
-
         chunk_size = getattr(self.config, "ttt_chunk", 4096)
 
-        # 为每个 OPD-TTT 层准备教师表示
         for layer_idx in self.opdttt_layers:
             if layer_idx < len(teacher_hidden):
-                # 计算该层的教师表示
                 layer_repr = compute_teacher_repr_targets(
                     teacher_logits=teacher_logits,
                     teacher_embeddings=teacher_embeddings,
@@ -431,74 +250,40 @@ class OPDTTTModel(nn.Module):
                     hidden_size=self.config.hidden_size,
                     chunk_size=chunk_size,
                 )
-                # 如果没有嵌入，使用隐藏状态
                 if layer_repr is None and layer_idx < len(teacher_hidden):
                     layer_repr = teacher_hidden[layer_idx]
                 teacher_repr[layer_idx] = layer_repr
-
         return teacher_repr
 
 
-class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
-    """
-    OPD-TTT 因果语言模型
-
-    这是完整的 OPD-TTT 学生模型，支持：
-    1. 教师模型指导的训练
-    2. 四层损失函数
-    3. 分布式训练（FSDP2）
-    4. 标准的 HuggingFace 接口和生成方法
-    """
-
-    config_class = LlamaConfig
+class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = Qwen3Config
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["OPDTTTDecoderLayer"]
+    _no_split_modules = ["OPDQwen3DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
-    _can_record_outputs = {
-        "hidden_states": OPDTTTDecoderLayer,
-    }
+    _can_record_outputs = {"hidden_states": OPDQwen3DecoderLayer}
 
-    def __init__(self, config: LlamaConfig):
-        """
-        初始化 OPD-TTT 模型
-
-        Args:
-            config: 模型配置
-        """
+    def __init__(self, config: Qwen3Config):
         super().__init__(config)
-        self.model = OPDTTTModel(config)
+        self.model = OPDQwen3Model(config)
         self.vocab_size = config.vocab_size
-
-        # LM Head：将隐藏状态投影到词汇表
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # 权重绑定：LM Head 和嵌入层共享权重
         self.lm_head.weight = self.model.embed_tokens.weight
-
         self.post_init()
 
     def _init_weights(self, module):
-        """
-        初始化权重（论文 §9.3）：
-        - Conv1d (ttt_conv): 零初始化 → 初始 TTT update≈0，不破坏预训练模型
-        - 方阵 Linear (ttt_proj, teacher_proj): 稀疏对角矩阵 → 近零初始化
-        - 非方阵 Linear: 标准初始化
-        - Embedding: 正态分布
-        - RMSNorm: 全1
-        """
+        """初始化权重（论文 §9.3）：Conv1d 零初始化，ttt_proj 稀疏对角"""
         std = getattr(self.config, "initializer_range", 0.02)
-
         if isinstance(module, nn.Linear):
             if module.weight.device.type == "meta":
                 return
             if module.weight.shape[0] == module.weight.shape[1]:
-                # 方阵（ttt_proj, teacher_proj）: 稀疏对角初始化
                 weight_data = module.weight.data
                 if hasattr(weight_data, '_local_tensor'):
                     import torch.distributed as dist
@@ -524,9 +309,7 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
                 else:
                     weight_data.zero_()
                     diag_size = weight_data.shape[0]
-                    diag_values = torch.randn(
-                        diag_size, device=weight_data.device, dtype=weight_data.dtype
-                    ) * std
+                    diag_values = torch.randn(diag_size, device=weight_data.device, dtype=weight_data.dtype) * std
                     indices = torch.arange(diag_size, device=weight_data.device)
                     weight_data[indices, indices] = diag_values
             else:
@@ -548,101 +331,48 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
                 module.weight.data.fill_(1.0)
 
     def generate(self, **kwargs):
-        """
-        生成方法，支持标准的 HuggingFace generate 接口
-        
-        这个方法重写了 GenerationMixin.generate，确保在推理时不传递
-        教师相关的参数（teacher_logits, teacher_hidden_states, teacher_embeddings），
-        从而使 OPDTTTForCausalLM 兼容标准的 generate 方法。
-        
-        Args:
-            **kwargs: 所有标准的 generate 参数，如：
-                - input_ids: 输入 token IDs
-                - max_length: 最大生成长度
-                - do_sample: 是否采样
-                - temperature: 采样温度
-                - top_p: nucleus 采样参数
-                - etc.
-        
-        Returns:
-            生成的 token IDs
-        """
-        # 过滤掉教师相关参数，避免传递给 forward 方法
         teacher_params = ['teacher_logits', 'teacher_hidden_states', 'teacher_embeddings']
         for param in teacher_params:
             if param in kwargs:
                 del kwargs[param]
-        
-        # 调用父类的 generate 方法
         return super().generate(**kwargs)
 
     def get_input_embeddings(self):
-        """获取输入嵌入层"""
         return self.model.embed_tokens
 
     def set_input_embeddings(self, value):
-        """设置输入嵌入层"""
         self.model.embed_tokens = value
 
     def get_output_embeddings(self):
-        """获取输出嵌入层"""
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
-        """设置输出嵌入层"""
         self.lm_head = new_embeddings
 
     def set_decoder(self, decoder):
-        """设置解码器"""
         self.model = decoder
 
     def get_decoder(self):
-        """获取解码器"""
         return self.model
 
     @can_return_tuple
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        teacher_logits: Optional[torch.Tensor] = None,
-        teacher_hidden_states: Optional[List] = None,
-        teacher_embeddings: Optional[torch.Tensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        inputs_embeds=None,
+        labels=None,
+        use_cache=None,
+        cache_position=None,
+        teacher_logits=None,
+        teacher_hidden_states=None,
+        teacher_embeddings=None,
+        logits_to_keep=0,
         **kwargs,
-    ) -> CausalLMOutputWithPast:
-        """
-        前向传播，支持教师指导
-
-        Args:
-            input_ids: 输入 Token ID
-            attention_mask: 注意力掩码
-            position_ids: 位置 ID
-            past_key_values: 过去的键值对
-            inputs_embeds: 输入嵌入
-            labels: 真实标签
-            use_cache: 是否使用缓存
-            cache_position: 缓存位置
-            teacher_logits: 教师 logits [batch, seq_len, vocab_size]
-            teacher_hidden_states: 教师隐藏状态列表
-            teacher_embeddings: 教师输入嵌入
-            logits_to_keep: 保留的 logits 数量
-
-        Returns:
-            CausalLMOutputWithPast 包含：
-                loss: OPD-TTT 组合损失
-                logits: 学生模型 logits
-                past_key_values: 过去的键值对
-                hidden_states: 隐藏状态
-        """
-        # 准备教师输出字典
+    ):
         teacher_outputs = None
         if teacher_logits is not None or teacher_hidden_states is not None:
             teacher_outputs = {
@@ -651,7 +381,6 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
                 "embeddings": teacher_embeddings,
             }
 
-        # 模型前向传播
         hidden_states, ntp_losses = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -664,11 +393,9 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        # 计算 logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        # 计算组合损失
         loss = None
         loss_dict = {}
         if labels is not None:
@@ -680,11 +407,9 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
                     ntp_losses=ntp_losses,
                     attention_mask=attention_mask,
                 )
-                # 存储各个损失分量用于日志
                 loss_dict.update({k: v.detach() if isinstance(v, torch.Tensor) else v
                                  for k, v in loss_dict.items()})
             else:
-                # 标准的交叉熵损失
                 loss = self.model.compute_ce_loss(logits, labels, attention_mask)
                 loss_dict = {"lm_loss": loss.detach() if loss is not None else None}
 
@@ -698,9 +423,9 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
 
 
 __all__ = [
-    "OPDTTTForCausalLM",
-    "OPDTTTModel",
-    "OPDTTTDecoderLayer",
-    "OPDTTTMLP",
+    "OPDQwen3ForCausalLM",
+    "OPDQwen3Model",
+    "OPDQwen3DecoderLayer",
+    "OPDQwen3MLP",
     "OPDTTTLoss",
 ]

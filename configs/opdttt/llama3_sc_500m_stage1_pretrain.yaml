@@ -7,6 +7,8 @@ model:
   model_path: model_assets/llama_500m_config
   tokenizer_path: model_assets/tokenizer
   vocab_size: 151665
+  foundation:
+    sliding_window: 2048       # SWA窗口大小（论文500M配置，Table 8）
 
 # ========== 数据配置 ==========
 data:
@@ -69,7 +71,7 @@ opdttt:
   ttt_lr: 3
   ttt_chunk: 1024
   ttt_proj: true
-  ttt_max_norm: 1e-5       # Frobenius范数裁剪（根据论文3.2.6节）
+  ttt_max_norm: 0          # 不裁剪（官方训练模型无裁剪，论文仅推理时裁剪）
 
   # 阶段1损失权重（无教师）
   lambda_ntp: 1.0            # NTP对齐（自监督）
