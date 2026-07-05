@@ -122,7 +122,7 @@ class OPDTTTArguments:
     # 模型类型
     model_type: str = field(
         default="llama",
-        metadata={"help": "模型类型: llama 或 qwen3"},
+        metadata={"help": "模型类型: llama, qwen3, 或 qwen3_5"},
     )
     sliding_window: int = field(
         default=0,
@@ -245,6 +245,9 @@ def _get_model_class(model_type: str = "llama"):
     if model_type == "qwen3":
         from hf_models.hf_qwen3 import OPDQwen3ForCausalLM
         return OPDQwen3ForCausalLM
+    elif model_type == "qwen3_5":
+        from hf_models.hf_qwen3_5 import OPDQwen3_5ForCausalLM
+        return OPDQwen3_5ForCausalLM
     else:
         from hf_models.hf_llama import OPDTTTForCausalLM
         return OPDTTTForCausalLM
@@ -1279,7 +1282,8 @@ def build_teacher_model(
     # 检查 tokenizer vocab_size 一致性
     if tokenizer is not None:
         unified_vocab_size = len(tokenizer)
-        teacher_vocab_size = config.vocab_size
+        teacher_cfg = config.text_config if hasattr(config, 'text_config') and hasattr(config.text_config, 'vocab_size') else config
+        teacher_vocab_size = teacher_cfg.vocab_size
 
         if unified_vocab_size != teacher_vocab_size:
             logger.warning(
@@ -1293,8 +1297,8 @@ def build_teacher_model(
         else:
             logger.info(f"✓ 教师 vocab_size 与统一 tokenizer 一致: {unified_vocab_size}")
 
-    logger.info(f"教师模型已加载: {config.num_hidden_layers} 层, "
-                f"{config.num_attention_heads} 头, hidden_size={config.hidden_size}")
+    logger.info(f"教师模型已加载: {teacher_cfg.num_hidden_layers} 层, "
+                f"{teacher_cfg.num_attention_heads} 头, hidden_size={teacher_cfg.hidden_size}")
 
     return teacher_model
 
@@ -1428,6 +1432,27 @@ def main():
             logger.info_rank0(f"Qwen3 SWA: sliding_window={args.opdttt.sliding_window}, all {config.num_hidden_layers} layers")
         else:
             config.layer_types = ["full_attention"] * config.num_hidden_layers
+    elif args.opdttt.model_type == "qwen3_5":
+        # Qwen3.5 使用 text_config 嵌套结构
+        tc = config.text_config
+        tc.ttt_target = "input_embed"
+        tc.ttt_mode = True
+        tc.ttt_layers = args.opdttt.opdttt_layers
+        # 将 OPD-TTT 参数注入 text_config（模型从 text_config 读取）
+        tc.opdttt_mode = True
+        tc.opdttt_layers = args.opdttt.opdttt_layers
+        tc.lambda_kl = float(args.opdttt.lambda_kl)
+        tc.lambda_lm = float(args.opdttt.lambda_lm)
+        tc.lambda_ntp = float(args.opdttt.lambda_ntp)
+        tc.lambda_align_rep = float(args.opdttt.lambda_align_rep)
+        tc.ttt_lr = float(args.opdttt.ttt_lr)
+        tc.ttt_chunk = int(args.opdttt.ttt_chunk)
+        tc.ttt_proj = args.opdttt.ttt_proj
+        tc.ttt_max_norm = float(args.opdttt.ttt_max_norm)
+        tc.weight_adaptation = args.opdttt.weight_adaptation
+        tc.teacher_proj_init = args.opdttt.teacher_proj_init
+        # Qwen3.5 已有 layer_types，不需要覆盖
+        logger.info_rank0(f"Qwen3.5: layers={tc.num_hidden_layers}, layer_types={tc.layer_types}, TTT layers={tc.opdttt_layers}")
     else:
         config.ttt_target = "input_embed"
         if args.opdttt.sliding_window > 0:
@@ -1453,19 +1478,30 @@ def main():
     if not teacher_path:
         teacher_path = ""
 
+    # Qwen3.5 的属性在 text_config 嵌套结构里，统一用 base_cfg 引用
+    base_cfg = config.text_config if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size') else config
+
     if teacher_path:
         from transformers import AutoConfig as AutoConfigTeacher
         try:
             teacher_config = AutoConfigTeacher.from_pretrained(teacher_path)
-            config.teacher_hidden_size = teacher_config.hidden_size
+            # Qwen3.5 使用 text_config 嵌套结构
+            if hasattr(teacher_config, 'text_config') and hasattr(teacher_config.text_config, 'hidden_size'):
+                config.teacher_hidden_size = teacher_config.text_config.hidden_size
+            else:
+                config.teacher_hidden_size = teacher_config.hidden_size
             logger.info_rank0(f"从教师配置读取 teacher_hidden_size: {config.teacher_hidden_size}")
         except Exception as e:
-            logger.info_rank0(f"无法从教师配置读取 teacher_hidden_size: {e}，使用学生模型 hidden_size: {config.hidden_size}")
-            config.teacher_hidden_size = config.hidden_size
+            logger.info_rank0(f"无法从教师配置读取 teacher_hidden_size: {e}，使用学生模型 hidden_size: {base_cfg.hidden_size}")
+            config.teacher_hidden_size = base_cfg.hidden_size
     else:
         # 如果没有教师模型，使用学生模型的 hidden_size
-        config.teacher_hidden_size = config.hidden_size
+        config.teacher_hidden_size = base_cfg.hidden_size
         logger.info_rank0(f"没有配置教师模型，使用学生模型 hidden_size 作为 teacher_hidden_size: {config.teacher_hidden_size}")
+
+    # Qwen3.5: 将 teacher_hidden_size 同步到 text_config
+    if args.opdttt.model_type == "qwen3_5" and hasattr(config, 'text_config'):
+        config.text_config.teacher_hidden_size = config.teacher_hidden_size
 
     # 检查是否存在模型权重，如果不存在则从配置初始化
     model_path = args.model.model_path
@@ -1483,6 +1519,36 @@ def main():
         from safetensors import safe_open
         import tempfile
         from collections import OrderedDict
+
+        # Qwen3.5 权重重映射：model.language_model.* -> model.*，过滤 visual/mtp
+        needs_remapping = args.opdttt.model_type == "qwen3_5"
+        if needs_remapping:
+            logger.info_rank0("Qwen3.5: 检测到多模态权重，执行键名重映射 model.language_model.* -> model.*")
+            tmp_dir = tempfile.mkdtemp(prefix="qwen35_ckpt_", dir=os.path.join(_project_root, "data", "output"))
+            from safetensors.torch import save_file
+            import shutil
+            for f in os.listdir(model_path):
+                src = os.path.join(model_path, f)
+                if not f.endswith('.safetensors'):
+                    if os.path.isfile(src):
+                        shutil.copy2(src, os.path.join(tmp_dir, f))
+                    continue
+                remapped = {}
+                with safe_open(src, framework="pt") as st:
+                    for key in st.keys():
+                        if key.startswith("model.language_model."):
+                            new_key = "model." + key[len("model.language_model."):]
+                            remapped[new_key] = st.get_tensor(key).clone()
+                        elif key.startswith("model.visual.") or key.startswith("mtp."):
+                            continue
+                        elif key == "lm_head.weight":
+                            continue  # tied weights
+                        else:
+                            remapped[key] = st.get_tensor(key).clone()
+                save_file(remapped, os.path.join(tmp_dir, f))
+            logger.info_rank0(f"Qwen3.5: 键名重映射完成，保存到 {tmp_dir}")
+            model_path = tmp_dir
+            fsdp_weights_path = tmp_dir
 
         # 用 meta device 创建模型来获取期望的参数形状
         with torch.device("meta"):
@@ -1532,14 +1598,36 @@ def main():
             fsdp_weights_path = model_path
 
     if has_weights:
-        logger.info_rank0(f"从预训练权重加载模型: {model_path}")
-        student_model = ModelClass.from_pretrained(
-            model_path,
-            config=config,
-            torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
-            attn_implementation=args.model.attn_implementation,
-            ignore_mismatched_sizes=True,
-        )
+        if args.opdttt.model_type == "qwen3_5":
+            # Qwen3.5: from_pretrained 的 post_init 会覆盖加载的权重，改用手动加载
+            logger.info_rank0(f"Qwen3.5: 从配置创建模型 + 手动加载预训练权重: {model_path}")
+            student_model = ModelClass._from_config(
+                config,
+                torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
+                attn_implementation=args.model.attn_implementation,
+            )
+            # 手动加载权重
+            from safetensors.torch import load_file
+            import glob as _glob
+            model_sd = student_model.state_dict()
+            loaded = 0
+            for sf in sorted(_glob.glob(os.path.join(model_path, "*.safetensors"))):
+                ckpt_sd = load_file(sf)
+                for k, v in ckpt_sd.items():
+                    if k in model_sd and model_sd[k].shape == v.shape:
+                        model_sd[k] = v.to(model_sd[k].dtype)
+                        loaded += 1
+            missing, unexpected = student_model.load_state_dict(model_sd, strict=False)
+            logger.info_rank0(f"Qwen3.5: 手动加载 {loaded} 个权重张量, {len(missing)} 个 missing (TTT 层)")
+        else:
+            logger.info_rank0(f"从预训练权重加载模型: {model_path}")
+            student_model = ModelClass.from_pretrained(
+                model_path,
+                config=config,
+                torch_dtype="bfloat16" if args.train.enable_mixed_precision else "float32",
+                attn_implementation=args.model.attn_implementation,
+                ignore_mismatched_sizes=True,
+            )
     else:
         logger.info_rank0(f"从配置初始化模型 (训练从开始): {config_path}")
         student_model = ModelClass._from_config(

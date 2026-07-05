@@ -272,7 +272,7 @@ class OPDTTTModel(nn.Module):
 
         return loss
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,

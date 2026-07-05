@@ -12,7 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import hf_llama   # noqa — registers TTT-Llama with AutoModel
-from . import hf_qwen3   # noqa — registers TTT-Qwen3 with AutoModel
-# from . import hf_qwen3_5  # noqa — Qwen3.5 TTT (显式导入，不自动注册)
-# from . import hf_lact    # noqa — registers LaCT with AutoModel (暂时禁用)
+from .modeling_qwen3_5_opdttt import (
+    OPDQwen3_5MLP,
+    OPDTTTLoss,
+    TeacherCache,
+    compute_teacher_repr_targets,
+)
+from .modeling_qwen3_5_opdttt_full import (
+    OPDQwen3_5ForCausalLM,
+    OPDQwen3_5TextModel,
+    OPDQwen3_5DecoderLayer,
+)
+
+__all__ = [
+    "OPDQwen3_5ForCausalLM",
+    "OPDQwen3_5TextModel",
+    "OPDQwen3_5DecoderLayer",
+    "OPDQwen3_5MLP",
+    "OPDTTTLoss",
+    "TeacherCache",
+    "compute_teacher_repr_targets",
+]

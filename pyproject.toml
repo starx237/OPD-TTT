@@ -1,23 +1,40 @@
 [project]
-name = "ttt"
+name = "ttt-opd"
 version = "0.1.0"
-description = "Add your description here"
+description = "OPD-TTT: In-place Test Time Training + On-policy Distillation"
 readme = "README.md"
 requires-python = ">=3.11"
+
+# 共享依赖（两个环境都需要的基础包）
 dependencies = [
-    "torch==2.5.1",
-    "torchvision==0.20.1", # 对应 torch 2.5.1 的稳定版本
-    "torchaudio==2.5.1",   # 对应 torch 2.5.1 的稳定版本
-    "flash-attn==2.7.0.post2", # 升级到支持 CUDA 12 + Torch 2.5 + Python 3.11 的版本
-    "VeOmni",
-    "transformers==4.57.3",
     "einops",
     "opt-einsum",
+    "wandb",
+    "psutil",
+    "VeOmni",
+]
+
+# ============ 环境选择 ============
+# 旧环境（Qwen3 / Llama3，Python 3.11 + torch 2.5.1 + transformers 4.57.3）:
+#   uv sync --extra qwen3
+# 新环境（Qwen3.5，Python 3.13 + torch 2.6.0 + transformers 5.9.0）:
+#   uv sync --extra qwen35
+#
+# 注意：两个环境互不兼容，请分别创建 .venv 和 .venv35：
+#   uv venv .venv   --python 3.11  && uv sync --extra qwen3
+#   uv venv .venv35 --python 3.13  && uv sync --extra qwen35
+
+[project.optional-dependencies]
+# === 旧环境：Qwen3-0.6B / Llama3（.venv，Python 3.11）===
+qwen3 = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "torchaudio==2.5.1",
+    "transformers==4.57.3",
+    "flash-attn==2.7.0.post2",
+    "torchdata",
     "liger-kernel",
     "datasets",
-    "psutil",
-    "wandb",
-    "torchdata",
     "blobfile",
     "diffusers",
     "tiktoken",
@@ -25,14 +42,52 @@ dependencies = [
     "modelscope",
 ]
 
+# === 新环境：Qwen3.5-2B / 9B（miniconda3，Python 3.13）===
+qwen35 = [
+    "torch==2.6.0+cu124",
+    "torchvision==0.21.0+cu124",
+    "transformers==5.9.0",
+    "flash-attn==2.7.4.post1",
+    "flash-linear-attention==0.5.1",
+    "nvidia-nccl-cu12==2.21.5",
+    "torchdata",
+    "liger-kernel",
+    "datasets",
+    "tiktoken",
+    "timm",
+    "modelscope",
+    "blobfile",
+    "diffusers",
+]
+
 [tool.uv]
 index-strategy = "unsafe-best-match"
-extra-index-url = ["https://download.pytorch.org/whl/cu121"]
+
+# === 旧环境（qwen3）的 wheel 源 ===
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
 
 [tool.uv.sources]
-torch = { url = "https://mirror.nju.edu.cn/pytorch/whl/cu121/torch-2.5.1+cu121-cp311-cp311-linux_x86_64.whl" }
-
-flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
-
-# 本地可编辑安装 VeOmni
+# VeOmni 本地可编辑安装（两个环境共享）
 VeOmni = { path = "./VeOmni", editable = true }
+
+# 旧环境 torch wheel
+torch = [
+    { extra = "qwen3",  url = "https://download.pytorch.org/whl/cu121/torch-2.5.1%2Bcu121-cp311-cp311-linux_x86_64.whl" },
+    { extra = "qwen35", index = "pytorch-cu124" },
+]
+torchvision = [
+    { extra = "qwen3",  url = "https://download.pytorch.org/whl/cu121/torchvision-0.20.1%2Bcu121-cp311-cp311-linux_x86_64.whl" },
+    { extra = "qwen35", index = "pytorch-cu124" },
+]
+# 旧环境 flash-attn wheel
+flash-attn = [
+    { extra = "qwen3",  url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.0.post2/flash_attn-2.7.0.post2+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" },
+]

@@ -483,7 +483,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
             return inputs_embeds
         return None
 
-    @check_model_inputs()
+    @check_model_inputs
     @auto_docstring
     def forward(
         self,

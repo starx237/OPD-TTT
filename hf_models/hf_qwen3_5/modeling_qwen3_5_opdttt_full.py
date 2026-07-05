@@ -1,34 +1,40 @@
 # coding=utf-8
 """
-OPD-TTT Qwen3 完整模型实现
+OPD-TTT Qwen3.5 完整模型实现
 
-基于 Llama OPD-TTT 适配 Qwen3 架构（Qwen3Attention 含 q_norm/k_norm）。
-训练用 OPDQwen3ForCausalLM，推理用 inference_model/。
+基于 transformers 5.9.0 内置的 Qwen3_5TextModel / Qwen3_5ForCausalLM，
+添加 TTT 层支持。仅使用 text_config（纯文本，无视觉）。
+
+关键适配点：
+- 继承 transformers 的 Qwen3_5RMSNorm, Qwen3_5Attention, Qwen3_5GatedDeltaNet, Qwen3_5TextRotaryEmbedding
+- MLP 替换为 OPDQwen3_5MLP（TTT 在 down_proj 上）
+- 4D position_ids (M-RoPE) 处理
+- layer_types 支持 linear_attention / full_attention 混合
 """
 
-from typing import Optional, Tuple, Union, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.modeling_rope_utils import dynamic_rope_update
 from transformers.masking_utils import create_causal_mask
 from transformers.utils import auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import check_model_inputs
 from transformers.modeling_layers import GradientCheckpointingLayer
 
-from .configuration_qwen3 import Qwen3Config
-from .modeling_qwen3 import (
-    Qwen3RMSNorm,
-    Qwen3RotaryEmbedding,
-    Qwen3Attention,
-    repeat_kv,
-    rotate_half,
-    apply_rotary_pos_emb,
+from transformers.models.qwen3_5.modeling_qwen3_5 import (
+    Qwen3_5RMSNorm,
+    Qwen3_5TextRotaryEmbedding,
+    Qwen3_5Attention,
+    Qwen3_5GatedDeltaNet,
+    Qwen3_5MLP as StdQwen3_5MLP,
 )
-from .modeling_qwen3_opdttt import (
-    OPDQwen3MLP,
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+from .modeling_qwen3_5_opdttt import (
+    OPDQwen3_5MLP,
     OPDTTTLoss,
     compute_teacher_repr_targets,
 )
@@ -36,16 +42,21 @@ from .modeling_qwen3_opdttt import (
 logger = logging.get_logger(__name__)
 
 
-class OPDQwen3DecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+class OPDQwen3_5DecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: Qwen3_5TextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.layer_idx = layer_idx
+        self.layer_type = config.layer_types[layer_idx]
 
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
-        self.mlp = OPDQwen3MLP(config, layer_idx=layer_idx)
-        self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.layer_type == "linear_attention":
+            self.linear_attn = Qwen3_5GatedDeltaNet(config, layer_idx)
+        elif self.layer_type == "full_attention":
+            self.self_attn = Qwen3_5Attention(config, layer_idx)
+
+        self.mlp = OPDQwen3_5MLP(config, layer_idx=layer_idx)
+        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.is_opdttt_layer = getattr(config, "opdttt_mode", False) and layer_idx in getattr(
             config, "opdttt_layers", []
@@ -54,29 +65,35 @@ class OPDQwen3DecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        position_embeddings: tuple = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         target_states: Optional[torch.Tensor] = None,
-        teacher_repr: Optional[torch.Tensor] = None,
+        teacher_repr: Optional[Dict[int, torch.Tensor]] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, dict]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
-        hidden_states, _ = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            cache_position=cache_position,
-            position_embeddings=position_embeddings,
-            **kwargs,
-        )
+        if self.layer_type == "linear_attention":
+            hidden_states = self.linear_attn(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        elif self.layer_type == "full_attention":
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -98,19 +115,22 @@ class OPDQwen3DecoderLayer(GradientCheckpointingLayer):
         return hidden_states, mlp_losses
 
 
-class OPDQwen3Model(nn.Module):
-    def __init__(self, config: Qwen3Config):
+class OPDQwen3_5TextModel(nn.Module):
+    def __init__(self, config: Qwen3_5TextConfig):
         super().__init__()
+        # 兼容：若传入外层 Qwen3_5Config（含 text_config），自动提取
+        if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+            config = config.text_config
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [OPDQwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [OPDQwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
@@ -160,61 +180,57 @@ class OPDQwen3Model(nn.Module):
     ):
         if (input_ids is None) == (inputs_embeds is None):
             raise ValueError("必须且只能指定 input_ids 或 inputs_embeds 之一")
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
-
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
             cache_position = torch.arange(
                 past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
-
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
-
-        # For flash_attention_2, skip padding mask and rebuild position_ids to avoid
-        # the varlen path. flash_attn handles causality and sliding_window natively;
-        # padding tokens are ignored in the loss (labels=-100). Without this fix,
-        # padding (attention_mask with 0s, position_ids with 0s) triggers the varlen
-        # path in flash_attn, whose backward crashes at 32K+ sequences.
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+        elif position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
+        if position_ids.ndim == 3 and position_ids.shape[0] == 4:
+            text_position_ids = position_ids[0]
+            position_ids = position_ids[1:]
+        else:
+            text_position_ids = None
         if self.config._attn_implementation == "flash_attention_2":
             attention_mask = None
             position_ids = cache_position.unsqueeze(0)
-
+            text_position_ids = cache_position.unsqueeze(0)
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
-            position_ids=position_ids,
+            position_ids=text_position_ids,
         )
-
+        linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
         teacher_repr = None
         if teacher_outputs is not None and self.opdttt_mode:
             teacher_repr = self._prepare_teacher_repr(
                 teacher_outputs, inputs_embeds.shape[1], inputs_embeds.device
             )
-
         all_ntp_losses = {}
         target_states = self._resolve_ttt_target_states(inputs_embeds)
-
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
             hidden_states, layer_losses = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                attention_mask=layer_mask,
+                position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 cache_position=cache_position,
-                position_embeddings=position_embeddings,
                 target_states=target_states,
                 teacher_repr=teacher_repr,
                 inputs_embeds=inputs_embeds,
@@ -224,15 +240,20 @@ class OPDQwen3Model(nn.Module):
                 if key not in all_ntp_losses:
                     all_ntp_losses[key] = []
                 all_ntp_losses[key].append(value)
-
         hidden_states = self.norm(hidden_states)
-
         aggregated_losses = {}
         for key, losses in all_ntp_losses.items():
             if losses:
                 aggregated_losses[key] = torch.stack(losses).mean()
-
         return hidden_states, aggregated_losses
+
+    def _update_linear_attn_mask(self, attention_mask, past_key_values):
+        linear_attn_mask = attention_mask
+        if (past_key_values is not None and past_key_values.has_previous_state()) or (
+            attention_mask is not None and torch.all(attention_mask == 1)
+        ):
+            linear_attn_mask = None
+        return linear_attn_mask
 
     def _prepare_teacher_repr(self, teacher_outputs, seq_len, device):
         teacher_repr = {}
@@ -240,7 +261,6 @@ class OPDQwen3Model(nn.Module):
         teacher_logits = teacher_outputs.get("logits", None)
         teacher_embeddings = teacher_outputs.get("embeddings", None)
         chunk_size = getattr(self.config, "ttt_chunk", 4096)
-
         for layer_idx in self.opdttt_layers:
             if layer_idx < len(teacher_hidden):
                 layer_repr = compute_teacher_repr_targets(
@@ -256,29 +276,34 @@ class OPDQwen3Model(nn.Module):
         return teacher_repr
 
 
-class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
-    config_class = Qwen3Config
+class OPDQwen3_5ForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = Qwen3_5TextConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["OPDQwen3DecoderLayer"]
+    _no_split_modules = ["OPDQwen3_5DecoderLayer"]
     _skip_keys_device_placement = ["past_key_values"]
     _supports_flash_attn = True
     _supports_sdpa = True
 
     _can_compile_fullgraph = True
     _supports_attention_backend = True
-    _can_record_outputs = {"hidden_states": OPDQwen3DecoderLayer}
+    _can_record_outputs = {"hidden_states": OPDQwen3_5DecoderLayer}
+    # Qwen3.5 权重文件是完整多模态模型，文本权重前缀为 model.language_model.
+    # 我们的纯文本模型期望 model. 前缀，需要做键名映射
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3_5TextConfig):
+        # 兼容：若传入外层 Qwen3_5Config（含 text_config），自动提取
+        if hasattr(config, 'text_config') and hasattr(config.text_config, 'hidden_size'):
+            config = config.text_config
         super().__init__(config)
-        self.model = OPDQwen3Model(config)
+        self.model = OPDQwen3_5TextModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.lm_head.weight = self.model.embed_tokens.weight
         self.post_init()
 
     def _init_weights(self, module):
-        """初始化权重（论文 §9.3）：Conv1d 零初始化，ttt_proj 稀疏对角"""
         std = getattr(self.config, "initializer_range", 0.02)
         if isinstance(module, nn.Linear):
             if module.weight.device.type == "meta":
@@ -330,12 +355,10 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
             if hasattr(module, "weight") and module.weight is not None:
                 module.weight.data.fill_(1.0)
 
-    def generate(self, **kwargs):
-        teacher_params = ['teacher_logits', 'teacher_hidden_states', 'teacher_embeddings']
-        for param in teacher_params:
-            if param in kwargs:
-                del kwargs[param]
-        return super().generate(**kwargs)
+    def generate(self, *args, **kwargs):
+        for p in ['teacher_logits', 'teacher_hidden_states', 'teacher_embeddings']:
+            kwargs.pop(p, None)
+        return super().generate(*args, **kwargs)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -354,6 +377,111 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
+
+    def _chunked_ce_loss(self, hidden_states, labels, attention_mask, chunk_size=4096):
+        """分块计算 CE loss，避免实例化完整 logits [batch, seq_len, vocab_size]。
+        
+        vocab_size=248320 时，32K 序列的完整 logits 在 bf16 下约 16GB，
+        分块计算每次只需 chunk_size * vocab_size * 2 ≈ 2GB。
+        """
+        shift_hidden = hidden_states[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        if attention_mask is not None:
+            shift_mask = attention_mask[:, 1:].contiguous()
+        else:
+            shift_mask = torch.ones_like(shift_labels)
+        
+        total_loss = 0.0
+        total_tokens = 0
+        seq_len = shift_hidden.shape[1]
+        lm_weight = self.lm_head.weight  # [vocab_size, hidden_size]
+        
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            h_chunk = shift_hidden[:, start:end, :]  # [B, chunk, H]
+            l_chunk = shift_labels[:, start:end]      # [B, chunk]
+            m_chunk = shift_mask[:, start:end]         # [B, chunk]
+            
+            logits_chunk = torch.matmul(h_chunk, lm_weight.t())  # [B, chunk, V]
+            loss_chunk = F.cross_entropy(
+                logits_chunk.view(-1, self.vocab_size),
+                l_chunk.view(-1),
+                reduction="none",
+            ).view(l_chunk.shape)
+            
+            loss_chunk = loss_chunk * m_chunk
+            total_loss = total_loss + loss_chunk.sum()
+            total_tokens = total_tokens + m_chunk.sum()
+        
+        return total_loss / (total_tokens + 1e-8)
+
+    def _chunked_opd_loss(self, hidden_states, teacher_logits, labels, ntp_losses, attention_mask, chunk_size=4096):
+        """分块计算 OPD loss（KL + CE），避免实例化完整 student/teacher logits。
+        
+        OPD 模式下需要 student_logits 和 teacher_logits 计算 KL 散度。
+        分块计算：每次只实例化 chunk_size 个 token 的 logits。
+        """
+        lambda_kl = self.model.opdttt_loss.lambda_kl
+        lambda_lm = self.model.opdttt_loss.lambda_lm
+        vocab_size = self.vocab_size
+        lm_weight = self.lm_head.weight  # [vocab_size, hidden_size]
+
+        shift_hidden = hidden_states[:, :-1, :]
+        shift_labels = labels[:, 1:]
+        shift_teacher = teacher_logits[:, :-1, :] if teacher_logits is not None else None
+        if attention_mask is not None:
+            shift_mask = attention_mask[:, 1:].contiguous()
+        else:
+            shift_mask = torch.ones_like(shift_labels)
+
+        total_ce = 0.0
+        total_kl = 0.0
+        total_tokens = 0
+        seq_len = shift_hidden.shape[1]
+
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            h_chunk = shift_hidden[:, start:end, :]
+            l_chunk = shift_labels[:, start:end]
+            m_chunk = shift_mask[:, start:end]
+
+            # student logits（有梯度）
+            s_logits = torch.matmul(h_chunk, lm_weight.t())  # [B, chunk, V]
+
+            # CE loss
+            ce_chunk = F.cross_entropy(
+                s_logits.view(-1, vocab_size), l_chunk.view(-1), reduction="none"
+            ).view(l_chunk.shape)
+            ce_chunk = ce_chunk * m_chunk
+            total_ce = total_ce + ce_chunk.sum()
+
+            # KL loss
+            if shift_teacher is not None and lambda_kl > 0:
+                t_chunk = shift_teacher[:, start:end, :]  # [B, chunk, V] 无梯度
+                s_log_probs = F.log_softmax(s_logits, dim=-1)
+                t_probs = F.softmax(t_chunk, dim=-1)
+                kl_chunk = F.kl_div(s_log_probs, t_probs, reduction="none", log_target=False).sum(dim=-1)
+                kl_chunk = kl_chunk * m_chunk
+                total_kl = total_kl + kl_chunk.sum()
+
+            total_tokens = total_tokens + m_chunk.sum()
+
+        num_tokens = total_tokens + 1e-8
+        ce_loss = total_ce / num_tokens
+        kl_loss = total_kl / num_tokens if isinstance(total_kl, torch.Tensor) else torch.tensor(0.0, device=hidden_states.device)
+
+        total_loss = lambda_lm * ce_loss + lambda_kl * kl_loss
+
+        loss_dict = {
+            "lm_loss": ce_loss.detach(),
+            "kl_loss": kl_loss.detach() if isinstance(kl_loss, torch.Tensor) else kl_loss,
+            "total_loss": total_loss.detach(),
+        }
+        for k, v in ntp_losses.items():
+            if v is not None and isinstance(v, torch.Tensor):
+                loss_dict[k] = v.detach()
+
+        return total_loss, loss_dict
 
     @can_return_tuple
     @auto_docstring
@@ -380,7 +508,6 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
                 "hidden_states": teacher_hidden_states or [],
                 "embeddings": teacher_embeddings,
             }
-
         hidden_states, ntp_losses = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -393,25 +520,30 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
             **kwargs,
         )
 
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
-
         loss = None
         loss_dict = {}
+
         if labels is not None:
             if self.model.opdttt_mode:
-                loss, loss_dict = self.model.opdttt_loss(
-                    student_logits=logits,
-                    teacher_logits=teacher_logits,
-                    labels=labels,
-                    ntp_losses=ntp_losses,
-                    attention_mask=attention_mask,
-                )
-                loss_dict.update({k: v.detach() if isinstance(v, torch.Tensor) else v
-                                 for k, v in loss_dict.items()})
+                # 纯 TTT 模式（无教师）：用 chunked CE 避免大 logits OOM
+                if teacher_logits is None:
+                    loss = self._chunked_ce_loss(hidden_states, labels, attention_mask)
+                    loss_dict = {"lm_loss": loss.detach(), **{k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in ntp_losses.items()}}
+                else:
+                    # OPD 模式（有教师）：chunked KL+CE 避免大 logits OOM
+                    loss, loss_dict = self._chunked_opd_loss(
+                        hidden_states, teacher_logits, labels, ntp_losses, attention_mask
+                    )
             else:
-                loss = self.model.compute_ce_loss(logits, labels, attention_mask)
+                loss = self._chunked_ce_loss(hidden_states, labels, attention_mask)
                 loss_dict = {"lm_loss": loss.detach() if loss is not None else None}
+
+        # 推理/生成时仍需 logits（训练时不计算完整 logits 省显存）
+        if labels is None:
+            slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+            logits = self.lm_head(hidden_states[:, slice_indices, :])
+        else:
+            logits = None
 
         return CausalLMOutputWithPast(
             loss=loss,
@@ -423,9 +555,9 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
 
 
 __all__ = [
-    "OPDQwen3ForCausalLM",
-    "OPDQwen3Model",
-    "OPDQwen3DecoderLayer",
-    "OPDQwen3MLP",
+    "OPDQwen3_5ForCausalLM",
+    "OPDQwen3_5TextModel",
+    "OPDQwen3_5DecoderLayer",
+    "OPDQwen3_5MLP",
     "OPDTTTLoss",
 ]

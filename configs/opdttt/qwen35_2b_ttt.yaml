@@ -1,0 +1,90 @@
+# Qwen3.5-2B + In-Place TTT 持续预训练
+#
+# 基于 Qwen3-0.6B TTT 配置适配 Qwen3.5-2B
+# - 24 层 (6 full + 18 linear attention)
+# - TTT 层放在 MLP down_proj 上（与 attention 类型无关）
+# - 每 4 层放一个 TTT 层: [0, 4, 8, 12, 16, 20]
+
+# ========== 模型配置 ==========
+model:
+  model_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  attn_implementation: flash_attention_2
+
+# ========== 数据配置 ==========
+data:
+  data_dir: data
+  train_path: data/piles_packed_32768_shuffled.jsonl
+  train_size: 20000000000
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 32768
+  text_keys: content_split
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/qwen35_2b_ttt
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 60
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: qwen35-2b-ttt-cpt
+  max_steps: 5000
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  dyn_bsz: false
+  optimizer: adamw
+  lr: 5.0e-6
+  lr_warmup_ratio: 0.02
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  weight_decay: 0.1
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: true
+  init_device: meta
+  empty_cache_steps: 10
+  seed: 42
+
+  checkpoint:
+    output_dir: data/output/qwen35_2b_ttt
+    manager: dcp
+    save_steps: 200
+    save_hf_weights: true
+
+# ========== OPD-TTT 配置 ==========
+opdttt:
+  model_type: qwen3_5
+  sliding_window: 2048
+
+  # 无教师（纯TTT持续预训练）
+  teacher_model_path: ""
+
+  # TTT层配置：每4层一个，共6个TTT层
+  opdttt_layers: [0, 4, 8, 12, 16, 20]
+  ttt_lr: 3
+  ttt_chunk: 4096
+  ttt_proj: true
+  ttt_max_norm: 0
+
+  # 损失权重（纯CE，无教师对齐）
+  lambda_ntp: 1.0
+  lambda_align_rep: 0.0
+  lambda_kl: 0.0
+  lambda_lm: 1.0
+
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"
+
+  # 检查点策略
+  keep_all_checkpoints: true
+  save_best: true

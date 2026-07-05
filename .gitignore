@@ -40,6 +40,7 @@ log.txt
 
 # Unit test / coverage reports
 .cache
+${PROJECT_ROOT}/
 htmlcov/
 .tox/
 .nox/
@@ -57,6 +58,7 @@ coverage.xml
 
 # Django stuff:
 *.log
+logs/
 local_settings.py
 db.sqlite3
 
@@ -100,6 +102,10 @@ ENV/
 env.bak/
 venv.bak/
 
+# Kilocode
+.kilo
+plans/
+
 # tokenizer
 model_assets/
 added_tokens.json
@@ -111,6 +117,7 @@ preprocessor_config.json
 special_tokens_map.json
 vocab.json
 processor_config.json
+teacher_model_test_report.json
 
 *.safetensors
 
@@ -185,4 +192,6 @@ data/output/
 
 documents/
 CLAUDE.md
+*.md
+!README.md
 export_chat_history.py
