@@ -194,4 +194,6 @@ documents/
 CLAUDE.md
 *.md
 !README.md
+!VeOmni/
+!VeOmni/**/*.md
 export_chat_history.py
