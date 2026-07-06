@@ -7,7 +7,7 @@ model:
     ttt_mode: true
     ttt_proj: true
     ttt_lr: 3
-    ttt_chunk: 4096
+    ttt_chunk: 1024
     ttt_target: input_embed
 
 data:

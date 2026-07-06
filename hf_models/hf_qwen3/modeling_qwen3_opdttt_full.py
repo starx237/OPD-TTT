@@ -13,7 +13,7 @@ from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.modeling_rope_utils import dynamic_rope_update
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.utils import auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import check_model_inputs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -83,7 +83,7 @@ class OPDQwen3DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if target_states is None and self.is_opdttt_layer:
-            target_states = kwargs.get("inputs_embeds", hidden_states)
+            target_states = hidden_states
 
         layer_teacher_repr = None
         if teacher_repr is not None and self.is_opdttt_layer:
@@ -115,7 +115,7 @@ class OPDQwen3Model(nn.Module):
 
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
         self.opdttt_mode = getattr(config, "opdttt_mode", False)
-        self.ttt_target = getattr(config, "ttt_target", "input_embed")
+        self.ttt_target = getattr(config, "ttt_target", "hidden_states")
 
         if self.opdttt_mode:
             self.opdttt_loss = OPDTTTLoss(
@@ -185,7 +185,7 @@ class OPDQwen3Model(nn.Module):
             attention_mask = None
             position_ids = cache_position.unsqueeze(0)
 
-        causal_mask = create_causal_mask(
+        mask_kwargs = dict(
             config=self.config,
             input_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -193,6 +193,9 @@ class OPDQwen3Model(nn.Module):
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
+        causal_mask = create_causal_mask(**mask_kwargs)
+        has_sliding = "sliding_attention" in getattr(self.config, "layer_types", [])
+        sw_causal_mask = create_sliding_window_causal_mask(**mask_kwargs) if has_sliding else None
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -206,10 +209,12 @@ class OPDQwen3Model(nn.Module):
         all_ntp_losses = {}
         target_states = self._resolve_ttt_target_states(inputs_embeds)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            layer_type = self.config.layer_types[i] if has_sliding else "full_attention"
+            layer_mask = sw_causal_mask if layer_type == "sliding_attention" else causal_mask
             hidden_states, layer_losses = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=layer_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
@@ -413,13 +418,16 @@ class OPDQwen3ForCausalLM(PreTrainedModel, GenerationMixin):
                 loss = self.model.compute_ce_loss(logits, labels, attention_mask)
                 loss_dict = {"lm_loss": loss.detach() if loss is not None else None}
 
-        return CausalLMOutputWithPast(
+        outputs = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=None,
         )
+        if loss_dict:
+            outputs.loss_dict = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+        return outputs
 
 
 __all__ = [

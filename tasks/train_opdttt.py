@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -166,7 +166,7 @@ class OPDTTTArguments:
         metadata={"help": "快速权重学习率"},
     )
     ttt_chunk: int = field(
-        default=4096,
+        default=1024,
         metadata={"help": "TTT 处理的分块大小"},
     )
     ttt_proj: bool = field(
@@ -955,7 +955,7 @@ class OPDTTTTrainer:
         self,
         micro_batch: Dict[str, torch.Tensor],
         length_in_batch: torch.Tensor,
-    ) -> float:
+    ) -> Tuple[float, Dict[str, Any]]:
         """
         执行单个训练步骤
 
@@ -1025,7 +1025,8 @@ class OPDTTTTrainer:
         with self.model_bwd_context:
             loss.backward()
 
-        return loss.item()
+        step_loss_dict = getattr(student_outputs, "loss_dict", {})
+        return loss.item(), step_loss_dict
 
     def train(self, train_steps: int, start_step: int = 0):
         """
@@ -1095,6 +1096,7 @@ class OPDTTTTrainer:
 
                 # 处理小批量
                 total_loss = 0.0
+                step_metrics: Dict[str, float] = {}
                 if enable_opd:
                     num_micro_batches = len(micro_batches)
                     for micro_batch in micro_batches:
@@ -1105,10 +1107,12 @@ class OPDTTTTrainer:
                         total_loss += loss
                         del micro_batch
                 else:
-                    # 标准模式：使用训练数据的teacher-student训练
                     for micro_batch in micro_batches:
-                        loss = self.train_step(micro_batch, length_in_batch)
+                        loss, mb_metrics = self.train_step(micro_batch, length_in_batch)
                         total_loss += loss
+                        for k, v in mb_metrics.items():
+                            if isinstance(v, (int, float)):
+                                step_metrics[k] = step_metrics.get(k, 0.0) + v / max(len(micro_batches), 1)
                         del micro_batch
 
                 # 梯度裁剪和优化
@@ -1139,15 +1143,15 @@ class OPDTTTTrainer:
 
                 # 日志记录
                 if self.args.train.global_rank == 0 and self.args.train.use_wandb:
-                    wandb.log(
-                        {
-                            "training/loss": total_loss,
-                            "training/perplexity": math.exp(total_loss),
-                            "training/grad_norm": grad_norm,
-                            "training/lr": lr,
-                        },
-                        step=global_step,
-                    )
+                    log_data = {
+                        "training/loss": total_loss,
+                        "training/perplexity": math.exp(total_loss),
+                        "training/grad_norm": grad_norm,
+                        "training/lr": lr,
+                    }
+                    for k, v in step_metrics.items():
+                        log_data[f"training/{k}"] = v
+                    wandb.log(log_data, step=global_step)
 
                 # 保存检查点
                 if (
@@ -1162,6 +1166,9 @@ class OPDTTTTrainer:
                         if self.args.train.global_rank == 0:
                             best_ckpt_path = self._save_best_checkpoint(global_step, last_ckpt_path, best_ckpt_path)
 
+                    # 评估多 context 长度 PPL
+                    self._evaluate_ppl(global_step)
+
             start_step = 0
 
         # 最终检查点：所有rank参与DCP加载（集合操作），仅rank0保存HF权重
@@ -1169,6 +1176,142 @@ class OPDTTTTrainer:
             self._save_hf_weights(global_step, last_ckpt_path)
         else:
             logger.info_rank0("跳过HF权重保存：无DCP检查点可用")
+
+    def _broadcast_eval_data(self, eval_ids, max_eval_len):
+        """将 rank 0 的评估数据 broadcast 到所有 rank，确保 FSDP2 forward 一致。"""
+        device = self.device
+        if not dist.is_initialized():
+            if eval_ids is None:
+                eval_ids = torch.randint(0, self.tokenizer.vocab_size, (1, max_eval_len))
+            return eval_ids.to(device)
+
+        shape = torch.tensor(
+            list(eval_ids.shape) if eval_ids is not None else [0, 0],
+            device=device, dtype=torch.long,
+        )
+        dist.broadcast(shape, src=0)
+
+        if eval_ids is None:
+            eval_ids = torch.zeros(shape[0].item(), shape[1].item(), dtype=torch.long, device=device)
+        else:
+            eval_ids = eval_ids.to(device)
+
+        dist.broadcast(eval_ids, src=0)
+        return eval_ids
+
+    def _evaluate_ppl(self, global_step: int):
+        """在多个 context 长度下评估 PPL（固定 target 往前追溯 + TTT on/off 对比）。
+
+        评估方式：
+        - 固定 target = 序列最后 target_len 个 token
+        - 对每个 ctx_len，用前 ctx_len 个 token 作为 context 预测同一组 target
+        - 从训练数据中取多条样本，取平均 PPL 消除单样本波动
+        - 同时评估 TTT on（SWA+TTT）和 TTT off（纯 SWA），对比 TTT 贡献
+        - 预期：TTT off PPL 基本不随 ctx 变化，TTT on PPL 随 ctx 降低
+
+        FSDP2 下所有 rank 必须参与 forward（集合操作），仅 rank 0 上传 wandb。
+        评估数据在首次调用时从训练数据中取固定样本，确保每次评估可比。
+        """
+        context_lengths = [2048, 4096, 8192, 16384]
+        target_len = 2048
+        max_eval_len = max(context_lengths) + target_len
+        num_eval_samples = 5
+
+        if not hasattr(self, "_eval_input_ids"):
+            data_path = os.path.join(self.args.data.data_dir, self.args.data.train_path)
+            eval_ids = None
+            if self.args.train.global_rank == 0:
+                import json as _json
+                samples = []
+                with open(data_path, "r") as f:
+                    for line in f:
+                        if len(samples) >= num_eval_samples:
+                            break
+                        data = _json.loads(line)
+                        text = data.get("content_split", data.get("content", ""))
+                        ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+                        if ids.shape[1] >= max_eval_len:
+                            samples.append(ids[:, -max_eval_len:])
+                if len(samples) == 0:
+                    with open(data_path, "r") as f:
+                        first_line = f.readline()
+                    data = _json.loads(first_line)
+                    text = data.get("content_split", data.get("content", ""))
+                    text = text * ((max_eval_len * 4 // len(text)) + 1)
+                    samples.append(self.tokenizer(text, return_tensors="pt")["input_ids"][:, :max_eval_len])
+                eval_ids = torch.cat(samples, dim=0)
+            self._eval_input_ids = self._broadcast_eval_data(eval_ids, max_eval_len)
+
+        ttt_mlps = [
+            layer.mlp for layer in self.student_model.model.layers
+            if hasattr(layer.mlp, "enable_opdttt")
+        ]
+
+        def _run_eval(ttt_on: bool) -> dict:
+            for mlp in ttt_mlps:
+                mlp.enable_opdttt = ttt_on
+            self.student_model.eval()
+            tag = "TTT-on" if ttt_on else "TTT-off"
+            all_ppls = {ctx: [] for ctx in context_lengths}
+            with torch.no_grad():
+                for s_idx in range(self._eval_input_ids.shape[0]):
+                    for ctx_len in context_lengths:
+                        total_len = ctx_len + target_len
+                        input_ids = self._eval_input_ids[s_idx:s_idx+1, -total_len:]
+                        labels = input_ids.clone()
+                        labels[:, :ctx_len] = -100
+                        try:
+                            outputs = self.student_model(
+                                input_ids=input_ids,
+                                labels=labels,
+                                use_cache=False,
+                            )
+                            loss = outputs.loss.item()
+                            ppl = math.exp(min(loss, 20.0))
+                        except torch.cuda.OutOfMemoryError:
+                            helper.empty_cache()
+                            ppl = float("nan")
+                        all_ppls[ctx_len].append(ppl)
+                        del outputs
+                        helper.empty_cache()
+            results = {}
+            for ctx_len in context_lengths:
+                valid = [p for p in all_ppls[ctx_len] if p == p]
+                results[ctx_len] = sum(valid) / len(valid) if valid else float("nan")
+                logger.info_rank0(
+                    f"Step {global_step} Eval PPL {tag} @ ctx={ctx_len}: {results[ctx_len]:.2f} "
+                    f"({len(valid)}/{len(all_ppls[ctx_len])} samples)"
+                )
+            return results
+
+        ppl_on = _run_eval(True)
+        ppl_off = _run_eval(False)
+
+        for mlp in ttt_mlps:
+            mlp.enable_opdttt = True
+        self.student_model.train()
+
+        if self.args.train.global_rank == 0 and self.args.train.use_wandb:
+            log_data = {}
+            for ctx, ppl in ppl_on.items():
+                log_data[f"eval/ppl_ttt_on_{ctx}"] = ppl
+            for ctx, ppl in ppl_off.items():
+                log_data[f"eval/ppl_ttt_off_{ctx}"] = ppl
+            table_on = wandb.Table(
+                data=[[ctx, ppl] for ctx, ppl in ppl_on.items()],
+                columns=["context_length", "ppl"],
+            )
+            table_off = wandb.Table(
+                data=[[ctx, ppl] for ctx, ppl in ppl_off.items()],
+                columns=["context_length", "ppl"],
+            )
+            log_data["eval/ppl_ttt_on"] = wandb.plot.line(
+                table_on, "context_length", "ppl", title="PPL vs Context (TTT on)"
+            )
+            log_data["eval/ppl_ttt_off"] = wandb.plot.line(
+                table_off, "context_length", "ppl", title="PPL vs Context (TTT off)"
+            )
+            wandb.log(log_data, step=global_step)
 
     def _save_checkpoint(self, global_step: int, last_ckpt_path: Optional[str]):
         """保存分布式检查点"""
@@ -1424,18 +1567,23 @@ def main():
         config.ttt_target = "hidden_states"
         config.ttt_mode = True
         config.ttt_layers = args.opdttt.opdttt_layers
-        # Qwen3 SWA 配置
         if args.opdttt.sliding_window > 0:
             config.use_sliding_window = True
             config.sliding_window = args.opdttt.sliding_window
-            config.layer_types = ["sliding_attention"] * config.num_hidden_layers
-            logger.info_rank0(f"Qwen3 SWA: sliding_window={args.opdttt.sliding_window}, all {config.num_hidden_layers} layers")
+            full_every = 7
+            config.layer_types = [
+                "full_attention" if i % full_every == 3 else "sliding_attention"
+                for i in range(config.num_hidden_layers)
+            ]
+            n_full = sum(1 for t in config.layer_types if t == "full_attention")
+            n_sliding = config.num_hidden_layers - n_full
+            logger.info_rank0(f"Qwen3 SWA: sliding_window={args.opdttt.sliding_window}, full={n_full}, sliding={n_sliding}")
         else:
             config.layer_types = ["full_attention"] * config.num_hidden_layers
     elif args.opdttt.model_type == "qwen3_5":
         # Qwen3.5 使用 text_config 嵌套结构
         tc = config.text_config
-        tc.ttt_target = "input_embed"
+        tc.ttt_target = "hidden_states"
         tc.ttt_mode = True
         tc.ttt_layers = args.opdttt.opdttt_layers
         # 将 OPD-TTT 参数注入 text_config（模型从 text_config 读取）
@@ -1452,9 +1600,13 @@ def main():
         tc.weight_adaptation = args.opdttt.weight_adaptation
         tc.teacher_proj_init = args.opdttt.teacher_proj_init
         # Qwen3.5 已有 layer_types，不需要覆盖
+        # SWA: 将 sliding_window 注入 text_config，full_attention 层会使用
+        if args.opdttt.sliding_window > 0:
+            tc.sliding_window = args.opdttt.sliding_window
+            logger.info_rank0(f"Qwen3.5 SWA: sliding_window={args.opdttt.sliding_window} (full_attention layers only)")
         logger.info_rank0(f"Qwen3.5: layers={tc.num_hidden_layers}, layer_types={tc.layer_types}, TTT layers={tc.opdttt_layers}")
     else:
-        config.ttt_target = "input_embed"
+        config.ttt_target = "hidden_states"
         if args.opdttt.sliding_window > 0:
             config.sliding_window = args.opdttt.sliding_window
             logger.info_rank0(f"Llama SWA: sliding_window={args.opdttt.sliding_window}")

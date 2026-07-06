@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
 from transformers.utils import auto_docstring, can_return_tuple, logging
 from transformers.utils.generic import check_model_inputs
 from transformers.modeling_layers import GradientCheckpointingLayer
@@ -61,6 +61,8 @@ class OPDQwen3_5DecoderLayer(GradientCheckpointingLayer):
         self.is_opdttt_layer = getattr(config, "opdttt_mode", False) and layer_idx in getattr(
             config, "opdttt_layers", []
         )
+        # SWA: sliding window for full_attention layers
+        self.sliding_window = getattr(config, "sliding_window", 0)
 
     def forward(
         self,
@@ -86,6 +88,8 @@ class OPDQwen3_5DecoderLayer(GradientCheckpointingLayer):
                 **kwargs,
             )
         elif self.layer_type == "full_attention":
+            if self.sliding_window > 0:
+                kwargs["sliding_window"] = self.sliding_window
             hidden_states, _ = self.self_attn(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
@@ -100,7 +104,7 @@ class OPDQwen3_5DecoderLayer(GradientCheckpointingLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if target_states is None and self.is_opdttt_layer:
-            target_states = kwargs.get("inputs_embeds", hidden_states)
+            target_states = hidden_states
 
         layer_teacher_repr = None
         if teacher_repr is not None and self.is_opdttt_layer:
@@ -135,7 +139,7 @@ class OPDQwen3_5TextModel(nn.Module):
 
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
         self.opdttt_mode = getattr(config, "opdttt_mode", False)
-        self.ttt_target = getattr(config, "ttt_target", "input_embed")
+        self.ttt_target = getattr(config, "ttt_target", "hidden_states")
 
         if self.opdttt_mode:
             self.opdttt_loss = OPDTTTLoss(
@@ -204,16 +208,22 @@ class OPDQwen3_5TextModel(nn.Module):
             attention_mask = None
             position_ids = cache_position.unsqueeze(0)
             text_position_ids = cache_position.unsqueeze(0)
-        causal_mask = create_causal_mask(
+        mask_kwargs = dict(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             position_ids=text_position_ids,
         )
+        causal_mask = create_causal_mask(**mask_kwargs)
+        sliding_window = getattr(self.config, "sliding_window", 0)
+        sw_causal_mask = None
+        if sliding_window > 0:
+            sw_causal_mask = create_sliding_window_causal_mask(**mask_kwargs)
         linear_attn_mask = self._update_linear_attn_mask(attention_mask, past_key_values)
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
         teacher_repr = None
         if teacher_outputs is not None and self.opdttt_mode:
             teacher_repr = self._prepare_teacher_repr(
@@ -222,7 +232,10 @@ class OPDQwen3_5TextModel(nn.Module):
         all_ntp_losses = {}
         target_states = self._resolve_ttt_target_states(inputs_embeds)
         for i, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
-            layer_mask = linear_attn_mask if self.config.layer_types[i] == "linear_attention" else causal_mask
+            if self.config.layer_types[i] == "linear_attention":
+                layer_mask = linear_attn_mask
+            else:
+                layer_mask = sw_causal_mask if sliding_window > 0 else causal_mask
             hidden_states, layer_losses = decoder_layer(
                 hidden_states,
                 position_embeddings=position_embeddings,
@@ -389,7 +402,7 @@ class OPDQwen3_5ForCausalLM(PreTrainedModel, GenerationMixin):
         if attention_mask is not None:
             shift_mask = attention_mask[:, 1:].contiguous()
         else:
-            shift_mask = torch.ones_like(shift_labels)
+            shift_mask = (shift_labels != -100).long()
         
         total_loss = 0.0
         total_tokens = 0
@@ -432,7 +445,7 @@ class OPDQwen3_5ForCausalLM(PreTrainedModel, GenerationMixin):
         if attention_mask is not None:
             shift_mask = attention_mask[:, 1:].contiguous()
         else:
-            shift_mask = torch.ones_like(shift_labels)
+            shift_mask = (shift_labels != -100).long()
 
         total_ce = 0.0
         total_kl = 0.0
@@ -545,13 +558,16 @@ class OPDQwen3_5ForCausalLM(PreTrainedModel, GenerationMixin):
         else:
             logits = None
 
-        return CausalLMOutputWithPast(
+        outputs = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=None,
         )
+        if loss_dict:
+            outputs.loss_dict = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+        return outputs
 
 
 __all__ = [

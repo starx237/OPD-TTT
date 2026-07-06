@@ -16,7 +16,7 @@ model:
     opdttt_layers: [0, 6, 12, 18]
     ttt_proj: true
     ttt_lr: 0.3
-    ttt_chunk: 4096
+    ttt_chunk: 1024
     ttt_target: input_embed
 
     # 阶段2损失权重：使用教师指导
@@ -80,7 +80,7 @@ opdttt:
 
   # TTT参数
   ttt_lr: 0.3
-  ttt_chunk: 2048             # 较小chunk，因为序列较短
+  ttt_chunk: 1024             # 较小chunk，因为序列较短
   ttt_proj: true
   ttt_max_norm: 0          # 不裁剪（官方训练模型无裁剪）
   opdttt_layers: [0, 6, 12, 18]

@@ -57,13 +57,13 @@ train:
   checkpoint:
     output_dir: data/output/qwen35_2b_ttt
     manager: dcp
-    save_steps: 200
+    save_steps: 100
     save_hf_weights: true
 
 # ========== OPD-TTT 配置 ==========
 opdttt:
   model_type: qwen3_5
-  sliding_window: 2048
+  sliding_window: 4096
 
   # 无教师（纯TTT持续预训练）
   teacher_model_path: ""
@@ -71,7 +71,7 @@ opdttt:
   # TTT层配置：每4层一个，共6个TTT层
   opdttt_layers: [0, 4, 8, 12, 16, 20]
   ttt_lr: 3
-  ttt_chunk: 4096
+  ttt_chunk: 1024
   ttt_proj: true
   ttt_max_norm: 0
 

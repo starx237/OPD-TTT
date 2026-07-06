@@ -26,7 +26,7 @@ model:
     ttt_lr: 0.3
 
     # 分块大小：用于并行处理
-    ttt_chunk: 4096
+    ttt_chunk: 1024
 
     # NTP 目标类型：使用输入嵌入
     ttt_target: input_embed
@@ -174,7 +174,7 @@ opdttt:
 
   # TTT/OPD-TTT 参数
   ttt_lr: 0.3
-  ttt_chunk: 4096
+  ttt_chunk: 1024
   ttt_proj: true
 
   # 应用 OPD-TTT 的层

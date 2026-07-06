@@ -3,11 +3,11 @@
 # 基于官方 In-Place-TTT 的 qwen3_longct.yaml 适配
 # 论文配置参考：
 #   - ttt_layers: 每6层（28层→[0,6,12,18,24]）
-#   - ttt_lr: 3, ttt_chunk: 4096（官方 continual 推荐）
+#   - ttt_lr: 3, ttt_chunk: 1024（官方 continual 推荐，chunk=1024）
 #   - ttt_target: hidden_states（持续训练用）
 #   - sliding_window: 2048（论文500M配置，Qwen3原生支持SWA）
 #   - ttt_max_norm: 0（不裁剪，与官方训练模型一致）
-#   - lr: 5e-6（官方 continual 推荐）
+#   - lr: 5e-6（官方 continual 推荐，chunk=1024）
 
 # ========== 模型配置 ==========
 model:
@@ -76,7 +76,7 @@ opdttt:
   # TTT层配置
   opdttt_layers: [0, 6, 12, 18, 24]
   ttt_lr: 3
-  ttt_chunk: 4096
+  ttt_chunk: 1024
   ttt_proj: true
   ttt_max_norm: 0
 

@@ -15,7 +15,7 @@ model:
     opdttt_layers: [0, 8, 16, 24]
     ttt_proj: true
     ttt_lr: 0.3
-    ttt_chunk: 2048
+    ttt_chunk: 1024
     ttt_target: input_embed
 
     # SFT损失权重：标准监督学习
@@ -79,7 +79,7 @@ opdttt:
   
   # TTT参数（与阶段1保持一致）
   ttt_lr: 0.3
-  ttt_chunk: 2048
+  ttt_chunk: 1024
   ttt_proj: true
   ttt_max_norm: 0          # 不裁剪（官方训练模型无裁剪）
   opdttt_layers: [0, 8, 16, 24]

@@ -142,7 +142,7 @@ class OPDTTTDecoderLayer(GradientCheckpointingLayer):
 
         # 准备 NTP 目标状态
         if target_states is None and self.is_opdttt_layer:
-            target_states = kwargs.get("inputs_embeds", hidden_states)
+            target_states = hidden_states
 
         # 准备教师表示（如果这是 OPD-TTT 层）
         layer_teacher_repr = None
@@ -203,7 +203,7 @@ class OPDTTTModel(nn.Module):
         # OPD-TTT 设置
         self.opdttt_layers = getattr(config, "opdttt_layers", [])
         self.opdttt_mode = getattr(config, "opdttt_mode", False)
-        self.ttt_target = getattr(config, "ttt_target", "input_embed")
+        self.ttt_target = getattr(config, "ttt_target", "hidden_states")
 
         # 损失函数
         if self.opdttt_mode:
@@ -688,13 +688,16 @@ class OPDTTTForCausalLM(PreTrainedModel, GenerationMixin):
                 loss = self.model.compute_ce_loss(logits, labels, attention_mask)
                 loss_dict = {"lm_loss": loss.detach() if loss is not None else None}
 
-        return CausalLMOutputWithPast(
+        outputs = CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=past_key_values,
             hidden_states=hidden_states,
             attentions=None,
         )
+        if loss_dict:
+            outputs.loss_dict = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()}
+        return outputs
 
 
 __all__ = [
