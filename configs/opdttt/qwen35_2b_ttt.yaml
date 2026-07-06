@@ -59,6 +59,7 @@ train:
     manager: dcp
     save_steps: 100
     save_hf_weights: true
+    load_path: data/output/qwen35_2b_ttt/checkpoints/global_step_100/global_step_100
 
 # ========== OPD-TTT 配置 ==========
 opdttt:

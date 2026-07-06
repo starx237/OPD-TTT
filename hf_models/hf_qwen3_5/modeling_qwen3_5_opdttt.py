@@ -196,6 +196,11 @@ class OPDQwen3_5MLP(nn.Module):
         loss_dict = {
             "ntp_loss": self._compute_repr_loss(output[:, :-1], ntp_target_3d[:, 1:]),
         }
+        with torch.no_grad():
+            cumulative_update = d_down_proj_sum[:, -1] - d_down_proj_sum[:, 0]
+            update_norm = cumulative_update.norm(p='fro')
+            total_norm = d_down_proj_sum[:, -1].norm(p='fro')
+            loss_dict["ttt_relative_contribution"] = update_norm / (total_norm + 1e-8)
         if self.lambda_align_rep > 0 and teacher_repr is not None:
             teacher_repr_3d = rearrange(teacher_repr, "b t c d -> b (t c) d")[:, : x.shape[1], :]
             dtype = teacher_repr_3d.dtype

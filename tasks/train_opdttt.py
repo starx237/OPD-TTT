@@ -1119,6 +1119,25 @@ class OPDTTTTrainer:
                 grad_norm = veomni_clip_grad_norm(
                     self.student_model, self.args.train.max_grad_norm
                 )
+
+                # 在 zero_grad 之前计算 TTT 指标（梯度随后会被清除）
+                ttt_conv_norm_sq = 0.0
+                ttt_grad_norm_sq = 0.0
+                ttt_param_count = 0
+                for layer in self.student_model.model.layers:
+                    mlp = layer.mlp
+                    if hasattr(mlp, "ttt_conv"):
+                        w = mlp.ttt_conv.weight
+                        if hasattr(w, '_local_tensor'):
+                            w = w._local_tensor
+                        ttt_conv_norm_sq += w.norm().item() ** 2
+                        if mlp.ttt_conv.weight.grad is not None:
+                            g = mlp.ttt_conv.weight.grad
+                            if hasattr(g, '_local_tensor'):
+                                g = g._local_tensor
+                            ttt_grad_norm_sq += g.norm().item() ** 2
+                        ttt_param_count += 1
+
                 self.optimizer.step()
                 self.lr_scheduler.step()
                 self.optimizer.zero_grad()
@@ -1150,7 +1169,16 @@ class OPDTTTTrainer:
                         "training/lr": lr,
                     }
                     for k, v in step_metrics.items():
-                        log_data[f"training/{k}"] = v
+                        if k.startswith("ttt_"):
+                            log_data[f"ttt/{k}"] = v
+                        else:
+                            log_data[f"training/{k}"] = v
+
+                    # TTT 模块监控指标
+                    if ttt_param_count > 0:
+                        log_data["ttt/ttt_conv_norm"] = (ttt_conv_norm_sq / ttt_param_count) ** 0.5
+                        log_data["ttt/ttt_grad_norm"] = (ttt_grad_norm_sq / ttt_param_count) ** 0.5
+
                     wandb.log(log_data, step=global_step)
 
                 # 保存检查点
@@ -1167,6 +1195,9 @@ class OPDTTTTrainer:
                             best_ckpt_path = self._save_best_checkpoint(global_step, last_ckpt_path, best_ckpt_path)
 
                     # 评估多 context 长度 PPL
+                    self._evaluate_ppl(global_step)
+                elif global_step == 1:
+                    # 第 1 步评估（不保存 checkpoint），及早发现评估 bug
                     self._evaluate_ppl(global_step)
 
             start_step = 0
@@ -1218,7 +1249,7 @@ class OPDTTTTrainer:
         num_eval_samples = 5
 
         if not hasattr(self, "_eval_input_ids"):
-            data_path = os.path.join(self.args.data.data_dir, self.args.data.train_path)
+            data_path = self.args.data.train_path
             eval_ids = None
             if self.args.train.global_rank == 0:
                 import json as _json
