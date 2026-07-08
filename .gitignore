@@ -197,3 +197,4 @@ CLAUDE.md
 !VeOmni/
 !VeOmni/**/*.md
 export_chat_history.py
+context/

@@ -1,9 +1,15 @@
-# Qwen3.5-2B + In-Place TTT 持续预训练
+# Qwen3.5-2B + In-Place TTT 评估配置（单 GPU）
 #
-# 基于 Qwen3-0.6B TTT 配置适配 Qwen3.5-2B
-# - 24 层 (6 full + 18 linear attention)
-# - TTT 层放在 MLP down_proj 上（与 attention 类型无关）
-# - 每 4 层放一个 TTT 层: [0, 4, 8, 12, 16, 20]
+# 与训练配置的关键区别：
+# - data_parallel_mode: ddp + init_device: cuda（单 GPU 下 fsdp2 不可用：
+#   VeOmni 要求 fsdp2→meta，但 1 GPU 时 fsdp_enabled=False 又拒绝 meta）
+# - DDP bf16 模型与 FSDP2 MixedPrecision 等价（forward 均 bf16），PPL 可信
+# - ttt_lr: 3.0（与训练一致，经设计决定，暂不修改）
+# - enable_activation_offload: false（评估在 no_grad 下无需保存激活，开启只增开销）
+# - load_path 由 OPDTTT_LOAD_PATH 环境变量覆盖，无需在此指定
+# - ttt_lr 可由 OPDTTT_EVAL_TTT_LR 环境变量覆盖
+#
+# 用法: bash scripts/eval_single.sh [GPU_ID] [STEP]
 
 # ========== 模型配置 ==========
 model:
@@ -30,14 +36,14 @@ data:
 # ========== 训练配置 ==========
 train:
   output_dir: data/output/qwen35_2b_ttt
-  data_parallel_mode: fsdp2
+  data_parallel_mode: ddp
   ulysses_parallel_size: 1
   global_batch_size: 60
   micro_batch_size: 1
   rmpad: false
   use_wandb: true
   wandb_project: opdttt-experiments
-  wandb_name: qwen35-2b-ttt-cpt
+  wandb_name: qwen35-2b-ttt-eval
   max_steps: 5000
   rmpad_with_pos_ids: false
   dyn_bsz_margin: 0
@@ -53,8 +59,8 @@ train:
   enable_gradient_checkpointing: true
   enable_full_shard: true
   enable_fsdp_offload: false
-  enable_activation_offload: true
-  init_device: meta
+  enable_activation_offload: false
+  init_device: cuda
   empty_cache_steps: 10
   seed: 42
 
@@ -63,7 +69,8 @@ train:
     manager: dcp
     save_steps: 100
     save_hf_weights: true
-    load_path: data/output/qwen35_2b_ttt/checkpoints/global_step_1200/global_step_1200
+    # load_path 由 OPDTTT_LOAD_PATH 环境变量覆盖
+    load_path: ""
 
 # ========== OPD-TTT 配置 ==========
 opdttt:
@@ -75,7 +82,9 @@ opdttt:
 
   # TTT层配置：每4层一个，共6个TTT层
   opdttt_layers: [0, 4, 8, 12, 16, 20]
-  ttt_lr: 3
+  # ttt_lr 与训练保持一致（3.0），经设计决定暂不修改。
+  # 如需实验不同评估学习率，可通过 OPDTTT_EVAL_TTT_LR 环境变量覆盖。
+  ttt_lr: 3.0
   ttt_chunk: 1024
   ttt_proj: true
   ttt_max_norm: 0

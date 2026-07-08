@@ -24,8 +24,8 @@ data:
   drop_last: true
   dataloader:
     type: native
-    num_workers: 0
-    prefetch_factor: null
+    num_workers: 2
+    prefetch_factor: 2
 
 # ========== 训练配置 ==========
 train:

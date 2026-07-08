@@ -1,0 +1,44 @@
+# Qwen3.5-2B 训练后权重评估配置
+#
+# 训练后的 Qwen3.5-2B + In-Place TTT 模型（TTT + SWA）
+# 可设置 TTT on/off 进行消融对比
+#
+# TTT 推理参数参考 documents/comp_report.md:
+#   - ttt_lr: 推理时用 0.3（官方推理默认值），训练时用 3
+#   - ttt_chunk: 1024（本项目训练配置）
+#   - sliding_window: 4096（SWA）
+#   - ttt_max_norm: 0（不裁剪；论文 §9.2 建议推理时裁剪 τ，但官方代码未实现）
+
+# ========== 模型配置 ==========
+model:
+  type: trained                  # trained = 训练后权重，支持 TTT
+  model_path: model_assets/qwen3.5-2b   # 基础模型路径（用于 tokenizer 和 config）
+  tokenizer_path: model_assets/qwen3.5-2b
+  ckpt_path: data/output/qwen35_2b_ttt/step800_hf  # 训练后 HF 格式权重
+  attn_implementation: flash_attention_2
+
+# ========== TTT 配置 ==========
+ttt:
+  enabled: true                  # true = TTT on, false = TTT off（消融对比）
+  opdttt_layers: [0, 4, 8, 12, 16, 20]  # TTT 层（每 4 层一个）
+  ttt_chunk: 1024                # TTT 分块大小（训练时用 1024）
+  ttt_lr: 0.3                    # 推理时 TTT 学习率（官方推理默认值；训练用 3）
+  ttt_target: hidden_states      # continual training 用 hidden_states
+  sliding_window: 4096           # SWA 窗口大小
+  ttt_max_norm: 0                # 推理时裁剪阈值（0=不裁剪）
+
+# ========== 采样参数 ==========
+# 与原始模型相同的官方推荐参数
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  max_new_tokens: 81920         # 官方推荐: 复杂数学竞赛用 81920
+
+# ========== 评估参数 ==========
+eval:
+  benchmark: hmmt
+  enable_thinking: true
+  prompt_suffix: " Please reason step by step, and put your final answer within \\boxed{}."

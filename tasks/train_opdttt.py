@@ -311,6 +311,8 @@ class OPDTTTTrainer:
         )
 
         # 为 DDP 模式添加 autocast 标志
+        # DDP 模式下模型为 bf16，autocast 确保 forward 一致性
+        # FSDP2 多 GPU 由 MixedPrecision 自动处理，无需手动 autocast
         self.use_ddp_autocast = args.train.data_parallel_mode == "ddp" and args.train.enable_mixed_precision
         if self.use_ddp_autocast:
             logger.info("为 DDP 模式启用 autocast")
@@ -1062,7 +1064,8 @@ class OPDTTTTrainer:
         )
 
         for epoch in range(self.args.train.num_train_epochs):
-            if hasattr(self.train_dataloader, "set_epoch"):
+            # 续训时跳过 set_epoch，避免重置已恢复的 dataloader 状态
+            if start_step == 0 and hasattr(self.train_dataloader, "set_epoch"):
                 self.train_dataloader.set_epoch(epoch)
 
             data_loader_tqdm = trange(
@@ -1115,28 +1118,28 @@ class OPDTTTTrainer:
                                 step_metrics[k] = step_metrics.get(k, 0.0) + v / max(len(micro_batches), 1)
                         del micro_batch
 
+                # 跨 rank 聚合 step_metrics（FSDP2 数据并行下各 rank 处理不同数据，
+                # ttt_relative_contribution 等指标需跨 rank 平均才能与单 GPU 一致）
+                if step_metrics:
+                    _metric_keys = sorted(step_metrics.keys())
+                    _metric_t = torch.tensor(
+                        [step_metrics[k] for k in _metric_keys],
+                        device=self.device, dtype=torch.float32,
+                    )
+                    _metric_t = all_reduce(_metric_t, op="mean", group=self.parallel_state.fsdp_group)
+                    if isinstance(_metric_t, (int, float)):
+                        _metric_t = [_metric_t]
+                    for _mk, _mv in zip(_metric_keys, _metric_t):
+                        step_metrics[_mk] = _mv
+
                 # 梯度裁剪和优化
                 grad_norm = veomni_clip_grad_norm(
                     self.student_model, self.args.train.max_grad_norm
                 )
 
-                # 在 zero_grad 之前计算 TTT 指标（梯度随后会被清除）
-                ttt_conv_norm_sq = 0.0
-                ttt_grad_norm_sq = 0.0
-                ttt_param_count = 0
-                for layer in self.student_model.model.layers:
-                    mlp = layer.mlp
-                    if hasattr(mlp, "ttt_conv"):
-                        w = mlp.ttt_conv.weight
-                        if hasattr(w, '_local_tensor'):
-                            w = w._local_tensor
-                        ttt_conv_norm_sq += w.norm().item() ** 2
-                        if mlp.ttt_conv.weight.grad is not None:
-                            g = mlp.ttt_conv.weight.grad
-                            if hasattr(g, '_local_tensor'):
-                                g = g._local_tensor
-                            ttt_grad_norm_sq += g.norm().item() ** 2
-                        ttt_param_count += 1
+                # 在 zero_grad 之前计算 TTT 参数范数（梯度随后会被清除）
+                # FSDP2 下跨 rank 聚合本地分片范数平方，得到完整参数范数（与单 GPU 一致）
+                ttt_param_norms = self._compute_ttt_param_norms()
 
                 self.optimizer.step()
                 self.lr_scheduler.step()
@@ -1174,10 +1177,9 @@ class OPDTTTTrainer:
                         else:
                             log_data[f"training/{k}"] = v
 
-                    # TTT 模块监控指标
-                    if ttt_param_count > 0:
-                        log_data["ttt/ttt_conv_norm"] = (ttt_conv_norm_sq / ttt_param_count) ** 0.5
-                        log_data["ttt/ttt_grad_norm"] = (ttt_grad_norm_sq / ttt_param_count) ** 0.5
+                    # TTT 模块参数监控指标（完整范数，已跨 rank 聚合）
+                    for _pn_k, _pn_v in ttt_param_norms.items():
+                        log_data[f"ttt/{_pn_k}"] = _pn_v
 
                     wandb.log(log_data, step=global_step)
 
@@ -1196,8 +1198,9 @@ class OPDTTTTrainer:
 
                     # 评估多 context 长度 PPL
                     self._evaluate_ppl(global_step)
-                elif global_step == 1:
-                    # 第 1 步评估（不保存 checkpoint），及早发现评估 bug
+                elif global_step == 1 or (start_step > 0 and global_step == start_step + 1):
+                    # 首步评估（不保存 checkpoint），及早发现评估 bug
+                    # 续训时也对续训后的第一步评估（global_step == start_step + 1）
                     self._evaluate_ppl(global_step)
 
             start_step = 0
@@ -1230,6 +1233,53 @@ class OPDTTTTrainer:
         dist.broadcast(eval_ids, src=0)
         return eval_ids
 
+    def _compute_ttt_param_norms(self) -> Dict[str, float]:
+        """计算 TTT 参数的完整范数（FSDP2 兼容）。
+
+        使用 full_tensor() 获取完整参数（DTensor 时 all_gather，普通 Tensor 时直接使用），
+        无需 all_reduce，结果与单 GPU 一致。
+
+        必须在 optimizer.zero_grad() 之前调用（梯度随后会被清除）。
+        返回 ttt_conv/ttt_proj 的权重范数与梯度范数（每层均方根）。
+        """
+        def _full(t):
+            if t is None:
+                return None
+            data = t.data if hasattr(t, "data") else t
+            if hasattr(data, "full_tensor"):
+                return data.full_tensor()
+            return data
+
+        conv_norm_sq = 0.0
+        proj_norm_sq = 0.0
+        conv_grad_norm_sq = 0.0
+        proj_grad_norm_sq = 0.0
+        num_layers = 0
+
+        for layer in self.student_model.model.layers:
+            mlp = layer.mlp
+            if hasattr(mlp, "ttt_conv"):
+                w = _full(mlp.ttt_conv.weight)
+                conv_norm_sq += w.norm().item() ** 2
+                if mlp.ttt_conv.weight.grad is not None:
+                    g = _full(mlp.ttt_conv.weight.grad)
+                    conv_grad_norm_sq += g.norm().item() ** 2
+                num_layers += 1
+            if hasattr(mlp, "ttt_proj") and mlp.ttt_proj is not None:
+                w = _full(mlp.ttt_proj.weight)
+                proj_norm_sq += w.norm().item() ** 2
+                if mlp.ttt_proj.weight.grad is not None:
+                    g = _full(mlp.ttt_proj.weight.grad)
+                    proj_grad_norm_sq += g.norm().item() ** 2
+
+        results: Dict[str, float] = {}
+        if num_layers > 0:
+            results["ttt_conv_norm"] = (conv_norm_sq / num_layers) ** 0.5
+            results["ttt_proj_norm"] = (proj_norm_sq / num_layers) ** 0.5
+            results["ttt_conv_grad_norm"] = (conv_grad_norm_sq / num_layers) ** 0.5
+            results["ttt_proj_grad_norm"] = (proj_grad_norm_sq / num_layers) ** 0.5
+        return results
+
     def _evaluate_ppl(self, global_step: int):
         """在多个 context 长度下评估 PPL（固定 target 往前追溯 + TTT on/off 对比）。
 
@@ -1246,24 +1296,20 @@ class OPDTTTTrainer:
         context_lengths = [2048, 4096, 8192, 16384]
         target_len = 2048
         max_eval_len = max(context_lengths) + target_len
-        num_eval_samples = 5
+        num_eval_samples = int(os.environ.get("OPDTTT_EVAL_SAMPLES", "20"))
+        group_size = int(os.environ.get("OPDTTT_EVAL_GROUP_SIZE", str(num_eval_samples)))
 
         if not hasattr(self, "_eval_input_ids"):
             data_path = self.args.data.train_path
             eval_ids = None
             if self.args.train.global_rank == 0:
-                import json as _json
-                samples = []
-                with open(data_path, "r") as f:
-                    for line in f:
-                        if len(samples) >= num_eval_samples:
-                            break
-                        data = _json.loads(line)
-                        text = data.get("content_split", data.get("content", ""))
-                        ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
-                        if ids.shape[1] >= max_eval_len:
-                            samples.append(ids[:, -max_eval_len:])
+                # 从文件末尾取评估样本：训练数据按顺序流式读取 + shuffle buffer，
+                # 5000 步内仅读到文件前 ~43%，末尾样本在训练过程中始终样本外，
+                # 避免用已训练过的开头样本导致评估失真
+                samples = self._load_eval_samples_from_tail(data_path, num_eval_samples, max_eval_len)
                 if len(samples) == 0:
+                    # 兜底：末尾无足够长样本时，从开头取并重复填充
+                    import json as _json
                     with open(data_path, "r") as f:
                         first_line = f.readline()
                     data = _json.loads(first_line)
@@ -1284,8 +1330,9 @@ class OPDTTTTrainer:
             self.student_model.eval()
             tag = "TTT-on" if ttt_on else "TTT-off"
             all_ppls = {ctx: [] for ctx in context_lengths}
+            num_samples = self._eval_input_ids.shape[0]
             with torch.no_grad():
-                for s_idx in range(self._eval_input_ids.shape[0]):
+                for s_idx in range(num_samples):
                     for ctx_len in context_lengths:
                         total_len = ctx_len + target_len
                         input_ids = self._eval_input_ids[s_idx:s_idx+1, -total_len:]
@@ -1305,14 +1352,43 @@ class OPDTTTTrainer:
                         all_ppls[ctx_len].append(ppl)
                         del outputs
                         helper.empty_cache()
+                    # 分组统计
+                    if (s_idx + 1) % group_size == 0:
+                        g_start = s_idx + 1 - group_size
+                        g_end = s_idx + 1
+                        parts = []
+                        for ctx_len in context_lengths:
+                            grp = [p for p in all_ppls[ctx_len][g_start:g_end] if p == p]
+                            g_mean = sum(grp) / len(grp) if grp else float("nan")
+                            parts.append(f"{ctx_len}:{g_mean:.3f}")
+                        logger.info_rank0(
+                            f"Step {global_step} Eval PPL {tag} "
+                            f"group[{g_start}:{g_end}]: {' | '.join(parts)}"
+                        )
+            # 整体统计
             results = {}
             for ctx_len in context_lengths:
                 valid = [p for p in all_ppls[ctx_len] if p == p]
-                results[ctx_len] = sum(valid) / len(valid) if valid else float("nan")
-                logger.info_rank0(
-                    f"Step {global_step} Eval PPL {tag} @ ctx={ctx_len}: {results[ctx_len]:.2f} "
-                    f"({len(valid)}/{len(all_ppls[ctx_len])} samples)"
-                )
+                if valid:
+                    mean = sum(valid) / len(valid)
+                    if len(valid) > 1:
+                        var = sum((p - mean) ** 2 for p in valid) / (len(valid) - 1)
+                        std = var ** 0.5
+                    else:
+                        std = 0.0
+                    results[ctx_len] = mean
+                    logger.info_rank0(
+                        f"Step {global_step} Eval PPL {tag} @ ctx={ctx_len}: "
+                        f"mean={mean:.4f} std={std:.4f} "
+                        f"min={min(valid):.4f} max={max(valid):.4f} "
+                        f"({len(valid)}/{len(all_ppls[ctx_len])} samples)"
+                    )
+                else:
+                    results[ctx_len] = float("nan")
+                    logger.info_rank0(
+                        f"Step {global_step} Eval PPL {tag} @ ctx={ctx_len}: "
+                        f"mean=nan ({len(valid)}/{len(all_ppls[ctx_len])} samples)"
+                    )
             return results
 
         ppl_on = _run_eval(True)
@@ -1328,21 +1404,132 @@ class OPDTTTTrainer:
                 log_data[f"eval/ppl_ttt_on_{ctx}"] = ppl
             for ctx, ppl in ppl_off.items():
                 log_data[f"eval/ppl_ttt_off_{ctx}"] = ppl
-            table_on = wandb.Table(
-                data=[[ctx, ppl] for ctx, ppl in ppl_on.items()],
-                columns=["context_length", "ppl"],
-            )
-            table_off = wandb.Table(
-                data=[[ctx, ppl] for ctx, ppl in ppl_off.items()],
-                columns=["context_length", "ppl"],
-            )
-            log_data["eval/ppl_ttt_on"] = wandb.plot.line(
-                table_on, "context_length", "ppl", title="PPL vs Context (TTT on)"
-            )
-            log_data["eval/ppl_ttt_off"] = wandb.plot.line(
-                table_off, "context_length", "ppl", title="PPL vs Context (TTT off)"
+            # TTT 贡献：ppl_off - ppl_on（正值表示 TTT 降低 PPL）
+            for ctx in ppl_on:
+                _on, _off = ppl_on[ctx], ppl_off[ctx]
+                if _on == _on and _off == _off:
+                    log_data[f"eval/ppl_delta_{ctx}"] = _off - _on
+            # 合并折线图：TTT on/off 同图，纵坐标自适应，附差值柱状图
+            log_data["eval/ppl_vs_ctx"] = self._plot_ppl_vs_ctx(
+                ppl_on, ppl_off, context_lengths, global_step
             )
             wandb.log(log_data, step=global_step)
+
+    def _load_eval_samples_from_tail(self, data_path: str, num_samples: int, min_len: int) -> List[torch.Tensor]:
+        """从数据文件末尾向前读取，取最后 num_samples 个 token 长度 >= min_len 的样本。
+
+        训练数据按顺序流式读取（shuffle buffer 仅局部打乱），5000 步内只读到文件前
+        ~43%，因此文件末尾的样本在整个训练过程中始终是样本外，用作评估集可避免
+        训练-评估数据泄漏。采用从文件尾向前 seek 的方式，避免遍历整个大文件。
+        """
+        import json as _json
+        samples: List[torch.Tensor] = []
+        with open(data_path, "rb") as f:
+            f.seek(0, 2)
+            file_size = f.tell()
+            chunk_size = 16 * 1024 * 1024  # 16MB
+            pos = file_size
+            buffer = ""
+            while pos > 0 and len(samples) < num_samples:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size).decode("utf-8", errors="ignore")
+                buffer = chunk + buffer
+                lines = buffer.split("\n")
+                if pos > 0:
+                    # 第一段可能被 chunk 截断，留到下次拼接
+                    buffer = lines[0]
+                    complete_lines = lines[1:]
+                else:
+                    buffer = ""
+                    complete_lines = lines
+                # 从末尾向前遍历完整行
+                for line in reversed(complete_lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        data = _json.loads(line)
+                    except Exception:
+                        continue
+                    text = data.get("content_split", data.get("content", ""))
+                    if not text:
+                        continue
+                    # 粗筛：字符长度至少 min_len*2（保守 token/char 比），减少 tokenize 调用
+                    if len(text) < min_len * 2:
+                        continue
+                    ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
+                    if ids.shape[1] >= min_len:
+                        samples.append(ids[:, -min_len:])
+                        if len(samples) >= num_samples:
+                            break
+        # samples 是从末尾向前收集的，反转为文件顺序（保证 target 在尾部、context 在前）
+        samples.reverse()
+        logger.info_rank0(
+            f"评估样本: 从文件末尾取 {len(samples)}/{num_samples} 个样本 "
+            f"(min_len={min_len}), 读取范围约 [pos={pos}, file_size={file_size}]"
+        )
+        return samples
+
+    def _plot_ppl_vs_ctx(self, ppl_on: dict, ppl_off: dict, context_lengths: list, global_step: int):
+        """生成 PPL vs Context 合并折线图（TTT on/off 同图）。
+
+        - 纵坐标自适应数据范围（不从 0 开始），避免曲线被压扁成一条直线
+        - 每点标注数值，便于区分两条极接近的曲线谁在上谁在下
+        - 下方附差值柱状图（ppl_off - ppl_on），正值=TTT 降低 PPL
+        """
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        ctxs = list(context_lengths)
+        ctx_labels = [f"{c // 1024}k" for c in ctxs]
+        ys_on = [ppl_on[c] for c in ctxs]
+        ys_off = [ppl_off[c] for c in ctxs]
+
+        fig = make_subplots(
+            rows=2, cols=1, row_heights=[0.68, 0.32],
+            vertical_spacing=0.13,
+            subplot_titles=(f"Step {global_step}: PPL vs Context (TTT on vs off)", "Δ PPL (off − on, 正值=TTT 降低)"),
+        )
+        # 上图：两条折线，标注数值
+        fig.add_trace(go.Scatter(
+            x=ctx_labels, y=ys_on, name="TTT-on", mode="lines+markers+text",
+            text=[f"{v:.3f}" for v in ys_on], textposition="top center",
+            line=dict(color="#1f77b4", width=2),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=ctx_labels, y=ys_off, name="TTT-off", mode="lines+markers+text",
+            text=[f"{v:.3f}" for v in ys_off], textposition="bottom center",
+            line=dict(color="#d62728", width=2, dash="dot"),
+        ), row=1, col=1)
+        # 纵坐标自适应：取所有值的范围并留 15% 边距，不从 0 开始
+        all_vals = [v for v in ys_on + ys_off if v == v]
+        if all_vals:
+            lo, hi = min(all_vals), max(all_vals)
+            pad = max((hi - lo) * 0.15, 1e-3)
+            fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1)
+        fig.update_xaxes(title_text="context length", type="category", row=1, col=1)
+        fig.update_yaxes(title_text="PPL", row=1, col=1)
+
+        # 下图：差值柱状图（正值绿色=TTT降低，负值红色=TTT升高）
+        deltas = [
+            (ppl_off[c] - ppl_on[c]) if (ppl_on[c] == ppl_on[c] and ppl_off[c] == ppl_off[c]) else 0.0
+            for c in ctxs
+        ]
+        fig.add_trace(go.Bar(
+            x=ctx_labels, y=deltas, name="Δ (off−on)",
+            marker_color=["#2ca02c" if d >= 0 else "#d62728" for d in deltas],
+            text=[f"{d:+.4f}" for d in deltas], textposition="outside",
+        ), row=2, col=1)
+        fig.update_yaxes(title_text="Δ PPL", row=2, col=1)
+        fig.update_xaxes(title_text="context length", type="category", row=2, col=1)
+
+        fig.update_layout(
+            height=580, legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.5),
+            margin=dict(t=90, b=40),
+        )
+        return fig
 
     def _save_checkpoint(self, global_step: int, last_ckpt_path: Optional[str]):
         """保存分布式检查点"""
@@ -1351,13 +1538,29 @@ class OPDTTTTrainer:
             self.args.train.save_checkpoint_path, f"global_step_{global_step}"
         )
 
+        extra_state = {
+            "global_step": global_step,
+            "lr_scheduler": self.lr_scheduler.state_dict(),
+        }
+
+        try:
+            extra_state["dataloader_state"] = self.train_dataloader.state_dict()
+        except Exception as e:
+            logger.warning(f"无法保存 dataloader 状态: {e}")
+
+        try:
+            import torch as _torch
+            extra_state["rng_state"] = {
+                "python": _torch.get_rng_state(),
+                "cuda": _torch.cuda.get_rng_state() if _torch.cuda.is_available() else None,
+            }
+        except Exception as e:
+            logger.warning(f"无法保存 RNG 状态: {e}")
+
         state = {
             "model": self.student_model,
             "optimizer": self.optimizer,
-            "extra_state": {
-                "global_step": global_step,
-                "lr_scheduler": self.lr_scheduler.state_dict(),
-            },
+            "extra_state": extra_state,
         }
 
         self.checkpointer.save(save_path, state, global_steps=global_step)
@@ -1519,12 +1722,29 @@ def main():
 
     # 准备数据
     logger.info_rank0("准备数据")
-    transform = partial(
-        _data_transform.process_plaintext_example,
-        tokenizer=tokenizer,
-        max_seq_len=args.data.max_seq_len,
-        text_keys=args.data.text_keys,
-    )
+    if args.data.data_type == "conversation":
+        chat_template = build_chat_template(args.data.chat_template, tokenizer)
+        transform = partial(
+            _data_transform.process_conversation_example,
+            chat_template=chat_template,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
+        )
+        logger.info_rank0(
+            f"  数据类型: conversation (chat_template={args.data.chat_template}, "
+            f"text_keys={args.data.text_keys}, max_seq_len={args.data.max_seq_len})"
+        )
+    else:
+        transform = partial(
+            _data_transform.process_plaintext_example,
+            tokenizer=tokenizer,
+            max_seq_len=args.data.max_seq_len,
+            text_keys=args.data.text_keys,
+        )
+        logger.info_rank0(
+            f"  数据类型: plaintext (text_keys={args.data.text_keys}, "
+            f"max_seq_len={args.data.max_seq_len})"
+        )
 
     train_dataset = build_dataset(
         transform=transform,
@@ -1571,7 +1791,43 @@ def main():
         num_workers=args.data.num_workers,
         drop_last=args.data.drop_last,
         collate_fn_kwargs=collate_fn_kwargs,
+        prefetch_factor=None if args.data.num_workers == 0 else getattr(args.data.dataloader, "prefetch_factor", 2),
     )
+
+    # replay 模式：重放 N 步 dataloader 并保存状态（用于重建缺失的 dataloader checkpoint）
+    # 用法: OPDTTT_REPLAY_STEPS=1200 torchrun --nproc_per_node=4 ...
+    replay_steps_str = os.environ.get("OPDTTT_REPLAY_STEPS", "").strip()
+    if replay_steps_str:
+        replay_steps = int(replay_steps_str)
+        save_dir = os.environ.get("OPDTTT_REPLAY_SAVE_DIR", "data/output/dataloader_states")
+        os.makedirs(save_dir, exist_ok=True)
+        logger.info_rank0(f"===== REPLAY 模式: 重放 {replay_steps} 步 dataloader =====")
+        if hasattr(train_dataloader, "set_epoch"):
+            train_dataloader.set_epoch(0)
+        data_iter = iter(train_dataloader)
+        t0 = time.time()
+        for i in range(replay_steps):
+            _ = next(data_iter)
+            if (i + 1) % 100 == 0:
+                logger.info_rank0(f"REPLAY: {i+1}/{replay_steps} 步 ({time.time()-t0:.1f}s)")
+        dl_state = train_dataloader.state_dict()
+        rank = args.train.global_rank
+        save_file = os.path.join(save_dir, f"dl_state_step{replay_steps}_rank{rank}.pt")
+        torch.save(dl_state, save_file)
+        logger.info_rank0(f"REPLAY 完成: 状态保存到 {save_file} (耗时 {time.time()-t0:.1f}s)")
+        dist.barrier()
+        dist.destroy_process_group()
+        return
+
+    # 环境变量覆盖（用于 eval-only 等场景，优先级高于配置文件）
+    _eval_ttt_lr = os.environ.get("OPDTTT_EVAL_TTT_LR", "").strip()
+    if _eval_ttt_lr:
+        args.opdttt.ttt_lr = float(_eval_ttt_lr)
+        logger.info_rank0(f"环境变量覆盖: ttt_lr={args.opdttt.ttt_lr} (OPDTTT_EVAL_TTT_LR)")
+    _override_load_path = os.environ.get("OPDTTT_LOAD_PATH", "").strip()
+    if _override_load_path:
+        args.train.checkpoint.load_path = _override_load_path
+        logger.info_rank0(f"环境变量覆盖: load_path={args.train.checkpoint.load_path} (OPDTTT_LOAD_PATH)")
 
     # 构建学生模型
     logger.info_rank0("构建学生模型")
@@ -1822,11 +2078,10 @@ def main():
     # 确认模型实际使用的 TTT 配置
     logger.info_rank0(f"模型 TTT 配置确认: ttt_chunk={config.ttt_chunk}, opdttt_layers={config.opdttt_layers}, ttt_lr={config.ttt_lr}")
 
-    # 对于从配置初始化的模型，需要先移动到目标设备
-    # build_parallelize_model 在 DDP 模式下不会自动移动设备
+    # 对于 DDP 模式，需要将模型移动到目标设备（FSDP2 模式由 build_parallelize_model 处理）
     from veomni.distributed.parallel_state import get_parallel_state
     parallel_state = get_parallel_state()
-    if not has_weights and parallel_state.dp_mode == "ddp":
+    if parallel_state.dp_mode == "ddp":
         device = torch.device(f"cuda:{parallel_state.local_rank}")
         logger.info_rank0(f"将模型移动到设备: {device}")
         student_model = student_model.to(device)
@@ -1846,6 +2101,12 @@ def main():
         enable_forward_prefetch=args.train.enable_forward_prefetch,
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
     )
+
+    # DDP 模式下 build_parallelize_model 会 upcast 到 float32，需转回 bfloat16
+    # 这与 FSDP2 MixedPrecision（forward 前 cast 到 bf16）等价，PPL 可信
+    if parallel_state.dp_mode == "ddp":
+        student_model = student_model.bfloat16()
+        logger.info_rank0("DDP 模式: 模型已转为 bfloat16 (与 FSDP2 MixedPrecision 等价)")
 
     helper.print_device_mem_info("构建学生模型后的显存使用")
 
@@ -1902,9 +2163,12 @@ def main():
 
     # 初始化 wandb
     if args.train.global_rank == 0 and args.train.use_wandb:
+        _wb_name = args.train.wandb_name
+        if os.environ.get("OPDTTT_EVAL_ONLY", "").strip() == "1":
+            _wb_name = f"{_wb_name}-evalonly"
         wandb.init(
             project=args.train.wandb_project,
-            name=args.train.wandb_name,
+            name=_wb_name,
             config={**vars(args.model), **vars(args.data), **vars(args.train), **vars(args.opdttt)},
         )
 
@@ -1935,8 +2199,48 @@ def main():
         start_step = extra_state.get("global_step", 0)
         if "lr_scheduler" in extra_state:
             lr_scheduler.load_state_dict(extra_state["lr_scheduler"])
+
+        # 恢复 dataloader 状态（断点续训时从中断处继续读取数据）
+        if "dataloader_state" in extra_state:
+            try:
+                train_dataloader.load_state_dict(extra_state["dataloader_state"])
+                logger.info_rank0("dataloader 状态已恢复")
+            except Exception as e:
+                logger.warning(f"无法恢复 dataloader 状态: {e}")
+        else:
+            logger.warning_rank0("检查点中无 dataloader 状态，数据将从文件开头重新读取")
+
+        # 恢复 RNG 状态
+        if "rng_state" in extra_state:
+            try:
+                import torch as _torch
+                _torch.set_rng_state(extra_state["rng_state"]["python"])
+                if extra_state["rng_state"]["cuda"] is not None and _torch.cuda.is_available():
+                    _torch.cuda.set_rng_state(extra_state["rng_state"]["cuda"])
+                logger.info_rank0("RNG 状态已恢复")
+            except Exception as e:
+                logger.warning(f"无法恢复 RNG 状态: {e}")
+
         logger.info_rank0(f"恢复成功: start_step={start_step}")
         dist.barrier()
+
+    # eval-only 模式：加载 checkpoint 后只评估一次 PPL，不训练
+    # 用于验证评估修复正确性、观察结果与耗时（OPDTTT_EVAL_ONLY=1 触发）
+    if os.environ.get("OPDTTT_EVAL_ONLY", "").strip() == "1":
+        _eval_step = start_step if start_step > 0 else 0
+        logger.info_rank0(f"===== EVAL-ONLY 模式: 评估 step {_eval_step} =====")
+        _eval_start = time.time()
+        trainer._evaluate_ppl(_eval_step)
+        synchronize()
+        dist.barrier()
+        _eval_elapsed = time.time() - _eval_start
+        if args.train.global_rank == 0:
+            logger.info(f"===== EVAL-ONLY 完成: 耗时 {_eval_elapsed:.1f}s =====")
+        del optimizer, lr_scheduler
+        helper.empty_cache()
+        dist.barrier()
+        dist.destroy_process_group()
+        return
 
     trainer.train(train_steps=train_steps, start_step=start_step)
 

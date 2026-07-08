@@ -1,0 +1,106 @@
+# Qwen3.5-2B OPD (On-Policy Distillation)
+# 阶段3：on-policy 蒸馏，教师 Qwen3.5-9B
+# 从 SFT checkpoint 的 HF 权重继续训练
+#
+# 数据: data/opd_train.jsonl ({"prompt": "<chat-formatted text>"})
+# 学生模型从 prompt 自回归采样，教师 9B 评分，NTP + KL 损失
+
+# ========== 模型配置 ==========
+model:
+  # SFT 完成后的 HF 权重（待 SFT 训练完成）
+  model_path: data/output/qwen35_2b_sft/step5000_hf
+  config_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  attn_implementation: flash_attention_2
+
+# ========== 数据配置（OPD plaintext 格式）==========
+data:
+  data_dir: data
+  train_path: data/opd_train.jsonl
+  eval_path: data/opd_val.jsonl
+  train_size: 100000000  # 100K prompts
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: plaintext
+  max_seq_len: 65536
+  text_keys: prompt
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/qwen35_2b_opd
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 32  # OPD 密集奖励，较小 batch；长序列显存敏感，实际启动时调整
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: qwen35-2b-opd
+  max_steps: 500  # OPD 收敛快（论文约 150 步有显著提升）
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  dyn_bsz: false
+  optimizer: adamw
+  lr: 1.0e-5  # OPD 较小 lr
+  lr_warmup_ratio: 0.05
+  lr_decay_style: constant  # OPD 通常用恒定 lr
+  lr_min: 1.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: false  # OPD 采样逻辑复杂，暂不开 offload
+  init_device: meta
+  empty_cache_steps: 10
+  seed: 42
+
+  checkpoint:
+    output_dir: data/output/qwen35_2b_opd
+    manager: dcp
+    save_steps: 50
+    save_hf_weights: true
+    load_path: ""
+
+# ========== OPD-TTT 配置 ==========
+opdttt:
+  model_type: qwen3_5
+  sliding_window: 4096
+
+  # 教师模型（9B）
+  teacher_model_path: model_assets/qwen3.5-9b
+
+  # 启用 OPD on-policy 采样（核心功能）
+  enable_opd_sampling: true
+  enable_teacher_cache: true
+
+  # TTT 层配置（与 CPT/SFT 一致）
+  opdttt_layers: [0, 4, 8, 12, 16, 20]
+  ttt_lr: 3
+  ttt_chunk: 1024
+  ttt_proj: true
+  ttt_max_norm: 0
+
+  # OPD 采样参数（官方推荐 thinking mode 参数）
+  opd_temperature: 1.0
+  opd_top_p: 0.95
+  opd_max_sample_length: 63488  # 65536 - 2048 prompt 余量
+  opd_num_trajectories: 1
+  opd_prompt_field: prompt
+
+  # 损失权重：纯 NTP + KL（lambda_align_rep=0.0，用户确认）
+  lambda_ntp: 1.0
+  lambda_lm: 0.0
+  lambda_align_rep: 0.0
+  lambda_kl: 0.5  # forward KL 正则化，防止 on-policy 模式崩溃
+
+  # 权重初始化
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"
+
+  # 检查点策略
+  keep_all_checkpoints: true
+  save_best: true

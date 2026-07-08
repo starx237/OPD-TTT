@@ -1,0 +1,103 @@
+# Qwen3.5-2B SFT (基于 OpenThoughts-3)
+# 阶段2：监督微调，conversation 格式 + prompt masking
+# 从 CPT checkpoint 的 HF 权重继续训练
+#
+# 数据: data/sft_train.jsonl ({"messages": [{"role":"user",...},{"role":"assistant",...}]})
+# OT3 response 格式 <think>...</think>\n\n<answer> 与 Qwen3.5 thinking mode 兼容
+# VeOmni ChatmlTemplate 对 assistant 计算 loss，user 部分被 mask
+
+# ========== 模型配置 ==========
+model:
+  # CPT 完成后的 HF 权重（待 CPT 训练到 step 5000 后使用）
+  # 如 CPT 提前停止，改用实际最终 step 的 step{N}_hf 目录
+  model_path: data/output/qwen35_2b_ttt/step5000_hf
+  # step{N}_hf 只含 model.safetensors，config 从原始模型目录加载
+  config_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  attn_implementation: flash_attention_2
+
+# ========== 数据配置（SFT conversation 格式）==========
+data:
+  data_dir: data
+  train_path: data/sft_train.jsonl
+  eval_path: data/sft_val.jsonl
+  train_size: 8000000000  # ~8B tokens
+  dataloader_type: native
+  datasets_type: iterable
+  data_type: conversation
+  chat_template: chatml
+  # OT3 response 最长 ~18K tokens，prompt ~2K，32K 足够
+  # 若 Phase 1 后改用 9B 生成长 response，需增大此值
+  max_seq_len: 32768
+  text_keys: messages
+  drop_last: true
+
+# ========== 训练配置 ==========
+train:
+  output_dir: data/output/qwen35_2b_sft
+  data_parallel_mode: fsdp2
+  ulysses_parallel_size: 1
+  global_batch_size: 60
+  micro_batch_size: 1
+  rmpad: false
+  use_wandb: true
+  wandb_project: opdttt-experiments
+  wandb_name: qwen35-2b-sft
+  max_steps: 5000
+  rmpad_with_pos_ids: false
+  dyn_bsz_margin: 0
+  dyn_bsz: false
+  optimizer: adamw
+  lr: 5.0e-5  # SFT 用较高 lr（CPT 用 5e-6）
+  lr_warmup_ratio: 0.03
+  lr_decay_style: cosine
+  lr_decay_ratio: 0.90
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  enable_mixed_precision: true
+  enable_gradient_checkpointing: true
+  enable_full_shard: true
+  enable_fsdp_offload: false
+  enable_activation_offload: true
+  init_device: meta
+  empty_cache_steps: 10
+  seed: 42
+
+  checkpoint:
+    output_dir: data/output/qwen35_2b_sft
+    manager: dcp
+    save_steps: 500
+    save_hf_weights: true
+    load_path: ""  # 新阶段，不恢复 DCP 训练状态
+
+# ========== OPD-TTT 配置 ==========
+opdttt:
+  model_type: qwen3_5
+  sliding_window: 4096
+
+  # SFT 阶段无教师
+  teacher_model_path: ""
+
+  # TTT 层配置（与 CPT 一致，继续训练 TTT）
+  opdttt_layers: [0, 4, 8, 12, 16, 20]
+  ttt_lr: 3
+  ttt_chunk: 1024
+  ttt_proj: true
+  ttt_max_norm: 0
+
+  # 损失权重：标准监督学习（纯 CE，只对 assistant response 计算 loss）
+  lambda_ntp: 1.0
+  lambda_align_rep: 0.0
+  lambda_kl: 0.0
+  lambda_lm: 1.0
+
+  # 不启用 OPD 采样
+  enable_opd_sampling: false
+
+  teacher_proj_init: "random"
+  teacher_embeddings_path: ""
+  weight_adaptation: "fixed"
+
+  # 检查点策略
+  keep_all_checkpoints: true
+  save_best: true

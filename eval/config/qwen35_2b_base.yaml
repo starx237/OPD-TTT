@@ -1,0 +1,31 @@
+# Qwen3.5-2B 原始权重评估配置
+#
+# 原始 Qwen3.5-2B 模型（Full Attention，无 TTT）
+# 参考: https://huggingface.co/Qwen/Qwen3.5-2B
+#
+# 注意: Qwen3.5-2B 默认是非 thinking 模式（与 9B 不同），
+#       需要通过 enable_thinking=True 显式启用。
+
+# ========== 模型配置 ==========
+model:
+  type: base                    # base = 原始权重，无 TTT
+  model_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  attn_implementation: flash_attention_2
+
+# ========== 采样参数 ==========
+# 官方推荐: Thinking mode for text tasks
+# https://huggingface.co/Qwen/Qwen3.5-2B#best-practices
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5         # 防止 thinking 循环的关键参数
+  repetition_penalty: 1.0
+  max_new_tokens: 81920         # 官方推荐: 复杂数学竞赛用 81920
+
+# ========== 评估参数 ==========
+eval:
+  benchmark: hmmt
+  enable_thinking: true
+  prompt_suffix: " Please reason step by step, and put your final answer within \\boxed{}."

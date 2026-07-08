@@ -22,15 +22,11 @@ data:
   max_seq_len: 32768
   text_keys: content_split
   drop_last: true
-  dataloader:
-    type: native
-    num_workers: 0
-    prefetch_factor: null
 
 # ========== 训练配置 ==========
 train:
   output_dir: data/output/qwen35_2b_ttt
-  data_parallel_mode: fsdp2
+  data_parallel_mode: ddp
   ulysses_parallel_size: 1
   global_batch_size: 60
   micro_batch_size: 1
@@ -54,7 +50,7 @@ train:
   enable_full_shard: true
   enable_fsdp_offload: false
   enable_activation_offload: true
-  init_device: meta
+  init_device: cuda
   empty_cache_steps: 10
   seed: 42
 
@@ -63,7 +59,7 @@ train:
     manager: dcp
     save_steps: 100
     save_hf_weights: true
-    load_path: data/output/qwen35_2b_ttt/checkpoints/global_step_1200/global_step_1200
+    load_path: data/output/qwen35_2b_ttt/checkpoints/global_step_1500/global_step_1500
 
 # ========== OPD-TTT 配置 ==========
 opdttt:
