@@ -12,20 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    from . import hf_llama3
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_llama3: {e}")
+from .configuration_qwen3_5 import Qwen3_5TTTConfig
+from .modeling_qwen3_5 import (
+    Qwen3_5TTTModel,
+    Qwen3_5TTTForCausalLM,
+)
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
-try:
-    from . import hf_qwen3
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_qwen3: {e}")
-
-try:
-    from . import hf_qwen3_5
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_qwen3_5: {e}")
+AutoConfig.register("qwen3_5_opdttt", Qwen3_5TTTConfig, exist_ok=True)
+AutoModel.register(Qwen3_5TTTConfig, Qwen3_5TTTModel, exist_ok=True)
+AutoModelForCausalLM.register(Qwen3_5TTTConfig, Qwen3_5TTTForCausalLM, exist_ok=True)

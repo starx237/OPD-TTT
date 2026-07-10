@@ -1,16 +1,11 @@
 from opencompass.models import HuggingFaceBaseModel
 from opencompass.utils.text_postprocessors import extract_non_reasoning_content
 
-_model_configs = [
-    ("qwen35_2b_ttt_on", "data/output/qwen35_2b_ttt/hf_step2000_ttt_on"),
-    ("qwen35_2b_ttt_off", "data/output/qwen35_2b_ttt/hf_step2000_ttt_off"),
-]
-
 models = [
     dict(
         type=HuggingFaceBaseModel,
-        abbr=name,
-        path=path,
+        abbr="qwen35_2b_original",
+        path="model_assets/qwen3.5-2b",
         model_kwargs=dict(
             torch_dtype="bfloat16",
             trust_remote_code=True,
@@ -27,5 +22,4 @@ models = [
         run_cfg=dict(num_gpus=1),
         pred_postprocessor=dict(type=extract_non_reasoning_content),
     )
-    for name, path in _model_configs
 ]

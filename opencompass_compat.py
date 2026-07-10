@@ -12,20 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-try:
-    from . import hf_llama3
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_llama3: {e}")
+"""Compatibility patches for OpenCompass + transformers 5.x.
 
-try:
-    from . import hf_qwen3
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_qwen3: {e}")
+OpenCompass 0.5.3 uses tokenizer.batch_encode_plus() which was removed in
+transformers 5.x. This module re-adds it as an alias to __call__().
 
-try:
-    from . import hf_qwen3_5
-except Exception as e:
-    import warnings
-    warnings.warn(f"Failed to import hf_qwen3_5: {e}")
+Usage:
+    import opencompass_compat  # must be imported before opencompass
+    import opencompass
+"""
+
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+
+if not hasattr(PreTrainedTokenizerBase, "batch_encode_plus"):
+    def _batch_encode_plus(self, text, **kwargs):
+        return self(text, **kwargs)
+
+    PreTrainedTokenizerBase.batch_encode_plus = _batch_encode_plus

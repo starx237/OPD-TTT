@@ -186,6 +186,9 @@ data/*.jsonl.state.json
 data/data_process_*.log
 data/output/
 
+*.tar.gz
+*.zip
+
 *.run
 
 # Documents

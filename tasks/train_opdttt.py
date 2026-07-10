@@ -1295,6 +1295,13 @@ class OPDTTTTrainer:
         """
         context_lengths = [2048, 4096, 8192, 16384]
         target_len = 2048
+        # 环境变量覆盖：OPDTTT_EVAL_CTX="30720" 或 OPDTTT_EVAL_CTX="2048,4096,8192"
+        _eval_ctx = os.environ.get("OPDTTT_EVAL_CTX", "").strip()
+        if _eval_ctx:
+            context_lengths = [int(x.strip()) for x in _eval_ctx.split(",")]
+        _eval_target = os.environ.get("OPDTTT_EVAL_TARGET", "").strip()
+        if _eval_target:
+            target_len = int(_eval_target)
         max_eval_len = max(context_lengths) + target_len
         num_eval_samples = int(os.environ.get("OPDTTT_EVAL_SAMPLES", "20"))
         group_size = int(os.environ.get("OPDTTT_EVAL_GROUP_SIZE", str(num_eval_samples)))
