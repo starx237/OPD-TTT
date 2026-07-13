@@ -1,0 +1,37 @@
+# Qwen3.5-2B 原始权重 + SWA 评估配置 (HMMT Feb 2025)
+#
+# 原始 Qwen3.5-2B 权重 + SWA(4096)，无 TTT，无 CPT
+# 用 hf_original_swa checkpoint（已重映射 key + 设置 sliding_window=4096）
+
+# ========== 模型配置 ==========
+model:
+  type: trained
+  model_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  ckpt_path: data/output/qwen35_2b_ttt/hf_original_swa
+  attn_implementation: flash_attention_2
+
+# ========== TTT 配置（关闭）==========
+ttt:
+  enabled: false
+  opdttt_layers: [0, 4, 8, 12, 16, 20]
+  ttt_chunk: 1024
+  ttt_lr: 3.0
+  ttt_target: hidden_states
+  sliding_window: 4096
+  ttt_max_norm: 0
+
+# ========== 采样参数 ==========
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  max_new_tokens: 81920
+
+# ========== 评估参数 ==========
+eval:
+  benchmark: hmmt
+  enable_thinking: true
+  prompt_suffix: " Please reason step by step, and put your final answer within \\boxed{}."

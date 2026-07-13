@@ -1,15 +1,11 @@
 from opencompass.models import HuggingFaceBaseModel
 from opencompass.utils.text_postprocessors import extract_non_reasoning_content
 
-_model_configs = [
-    ("qwen35_2b_original_swa", "data/output/qwen35_2b_ttt/hf_original_swa"),
-]
-
 models = [
     dict(
         type=HuggingFaceBaseModel,
-        abbr=name,
-        path=path,
+        abbr="qwen35_2b_base",
+        path="model_assets/qwen3.5-2b-base",
         model_kwargs=dict(
             torch_dtype="bfloat16",
             trust_remote_code=True,
@@ -20,11 +16,10 @@ models = [
             top_p=0.95,
             top_k=20,
         ),
-        max_out_len=128,
+        max_out_len=64,
         batch_size=1,
         max_seq_len=131072,
         run_cfg=dict(num_gpus=1),
         pred_postprocessor=dict(type=extract_non_reasoning_content),
     )
-    for name, path in _model_configs
 ]

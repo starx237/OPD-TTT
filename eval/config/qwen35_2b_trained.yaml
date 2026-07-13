@@ -22,7 +22,7 @@ ttt:
   enabled: true                  # true = TTT on, false = TTT off（消融对比）
   opdttt_layers: [0, 4, 8, 12, 16, 20]  # TTT 层（每 4 层一个）
   ttt_chunk: 1024                # TTT 分块大小（训练时用 1024）
-  ttt_lr: 0.3                    # 推理时 TTT 学习率（官方推理默认值；训练用 3）
+  ttt_lr: 3                    # 推理时 TTT 学习率（官方推理默认值；训练用 3）
   ttt_target: hidden_states      # continual training 用 hidden_states
   sliding_window: 4096           # SWA 窗口大小
   ttt_max_norm: 0                # 推理时裁剪阈值（0=不裁剪）

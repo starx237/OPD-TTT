@@ -1,0 +1,42 @@
+# Qwen3.5-2B Step 5000 HMMT 评估配置 (TTT OFF)
+#
+# 基于 qwen35_2b_trained.yaml，更新 checkpoint 为 step 5000
+#
+# TTT 推理参数:
+#   - ttt_lr: 3.0（与训练一致）
+#   - ttt_chunk: 1024（本项目训练配置）
+#   - sliding_window: 4096（SWA）
+#   - ttt_max_norm: 0（不裁剪）
+
+# ========== 模型配置 ==========
+model:
+  type: trained
+  model_path: model_assets/qwen3.5-2b
+  tokenizer_path: model_assets/qwen3.5-2b
+  ckpt_path: data/output/qwen35_2b_ttt/hf_step5000
+  attn_implementation: flash_attention_2
+
+# ========== TTT 配置 ==========
+ttt:
+  enabled: false
+  opdttt_layers: [0, 4, 8, 12, 16, 20]
+  ttt_chunk: 1024
+  ttt_lr: 3.0
+  ttt_target: hidden_states
+  sliding_window: 4096
+  ttt_max_norm: 0
+
+# ========== 采样参数 ==========
+sampling:
+  temperature: 1.0
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  repetition_penalty: 1.0
+  max_new_tokens: 81920
+
+# ========== 评估参数 ==========
+eval:
+  benchmark: hmmt
+  enable_thinking: true
+  prompt_suffix: " Please reason step by step, and put your final answer within \\boxed{}."

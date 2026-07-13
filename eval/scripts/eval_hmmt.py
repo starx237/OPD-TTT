@@ -13,6 +13,8 @@
 import argparse
 import gc
 import glob
+import json
+import os
 import re
 import sys
 import time
@@ -25,6 +27,7 @@ from transformers import (
     AutoTokenizer,
     LogitsProcessor,
     Qwen3_5Config,
+    StoppingCriteria,
     TextStreamer,
 )
 from transformers.cache_utils import DynamicCache
@@ -36,35 +39,27 @@ sys.path.insert(0, PROJECT_ROOT)
 # ============================================================
 # HMMT 试题集
 # ============================================================
-HMMT_PROBLEMS = [
-    {
-        "problem": "Let a, b, c be positive reals with a+b+c=1. Find the minimum value of (1/a - 1)(1/b - 1)(1/c - 1).",
-        "answer": "8",
-    },
-    {
-        "problem": "How many positive integers less than 1000 are divisible by exactly one of 6 and 8?",
-        "answer": "208",
-    },
-    {
-        "problem": "Compute the sum of all positive divisors of 2024.",
-        "answer": "4320",
-    },
-    {
-        "problem": "Find the remainder when 7^100 is divided by 13.",
-        "answer": "9",
-    },
-    {
-        "problem": "In how many ways can 10 identical balls be distributed into 4 distinct boxes such that each box has at least one ball?",
-        "answer": "84",
-    },
-]
+def _load_hmmt_problems():
+    """从 eval/data/hmmt_feb_2025.json 加载 HMMT Feb 2025 真题（30 道）。"""
+    json_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "data", "hmmt_feb_2025.json")
+    with open(json_path) as f:
+        problems = json.load(f)
+    return [{"problem": p["problem"], "answer": p["answer"]} for p in problems]
+
+
+HMMT_PROBLEMS = _load_hmmt_problems()
 
 
 # ============================================================
 # PresencePenalty LogitsProcessor
 # ============================================================
 class PresencePenaltyLogitsProcessor(LogitsProcessor):
-    """对已出现过的 token 施加固定惩罚（vLLM 语义）。"""
+    """对已出现过的 token 施加 presence penalty（vLLM 语义）。
+
+    presence_penalty: flat 惩罚，出现过就 -penalty
+    repetition_penalty 由 HF 内置 RepetitionPenaltyLogitsProcessor 处理（除法惩罚）
+    """
 
     def __init__(self, presence_penalty=1.5):
         self.penalty = presence_penalty
@@ -73,6 +68,40 @@ class PresencePenaltyLogitsProcessor(LogitsProcessor):
         unique_tokens = input_ids[0].unique()
         scores[0, unique_tokens] -= self.penalty
         return scores
+
+
+class LoopDetectionStoppingCriteria(StoppingCriteria):
+    """检测模型陷入短循环（如 "Done. Done. Done."）并停止生成。
+
+    检查最近 N 个 token 是否由一个短序列（长度 L）重复构成。
+    如果最近 check_window 个 token 中，某个长度 L 的子序列重复了 threshold 次，停止。
+    """
+
+    def __init__(self, min_len=2, max_len=10, check_window=60, threshold=4):
+        self.min_len = min_len
+        self.max_len = max_len
+        self.check_window = check_window
+        self.threshold = threshold
+
+    def __call__(self, input_ids, scores, **kwargs):
+        seq = input_ids[0].tolist()
+        if len(seq) < self.check_window:
+            return False
+
+        window = seq[-self.check_window:]
+
+        for L in range(self.min_len, self.max_len + 1):
+            pattern = window[-L:]
+            count = 0
+            for i in range(0, len(window) - L + 1, L):
+                if window[i:i + L] == pattern:
+                    count += 1
+                else:
+                    break
+            if count >= self.threshold:
+                return True
+
+        return False
 
 
 # ============================================================
@@ -324,30 +353,76 @@ def load_trained_model(cfg):
 # 答案提取与判定
 # ============================================================
 def extract_boxed_answer(text):
-    """从文本中提取最后一个 \\boxed{} 内的答案。
+    """从文本中提取最后一个 \\boxed{} 内的答案，支持嵌套大括号。"""
+    result = None
+    idx = 0
+    while True:
+        pos = text.find("\\boxed{", idx)
+        if pos == -1:
+            break
+        # 找到匹配的右大括号
+        depth = 1
+        start = pos + len("\\boxed{")
+        i = start
+        while i < len(text) and depth > 0:
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+            i += 1
+        if depth == 0:
+            result = text[start:i-1].strip()
+        idx = i
+    return result
 
-    修复: 之前只在 </think> 之后的 answer 部分搜索，
-    现在在整个输出中搜索最后一个 \\boxed{}。
-    """
-    matches = re.findall(r"\\boxed\{([^}]*)\}", text)
-    if matches:
-        return matches[-1].strip()
-    return None
+
+def _normalize_latex(s):
+    """标准化 LaTeX 答案以便比较。"""
+    s = s.strip()
+    # 去除空格
+    s = s.replace(" ", "")
+    # 去除 \left \right
+    s = s.replace("\\left", "").replace("\\right", "")
+    # 去除 \displaystyle
+    s = s.replace("\\displaystyle", "")
+    # 统一分数写法
+    s = s.replace("\\dfrac", "\\frac")
+    s = s.replace("\\tfrac", "\\frac")
+    return s
 
 
 def check_answer(extracted, expected):
-    """检查提取的答案是否正确。"""
+    """检查提取的答案是否正确，支持整数、分数、LaTeX 表达式。"""
     if extracted is None:
         return False
     extracted = extracted.strip()
     expected = expected.strip()
-    if extracted == expected:
+
+    # 1. 精确字符串匹配
+    if _normalize_latex(extracted) == _normalize_latex(expected):
         return True
+
+    # 2. 数值比较
     try:
         if float(extracted) == float(expected):
             return True
     except (ValueError, TypeError):
         pass
+
+    # 3. sympy 符号比较（处理 \frac, \sqrt 等）
+    try:
+        import sympy
+        ext_expr = sympy.sympify(extracted.replace("\\frac", "Lambda").replace("{", "(").replace("}", ")").replace("^", "**"))
+        exp_expr = sympy.sympify(expected.replace("\\frac", "Lambda").replace("{", "(").replace("}", ")").replace("^", "**"))
+        if sympy.simplify(ext_expr - exp_expr) == 0:
+            return True
+    except Exception:
+        pass
+
+    # 4. 标准化后字符串匹配
+    if _normalize_latex(extracted) == _normalize_latex(expected):
+        return True
+
     return False
 
 
@@ -372,7 +447,9 @@ def evaluate_problem(model, tokenizer, cfg, problem_info, model_ctx=None):
     )["input_ids"].cuda()
 
     t0 = time.time()
-    logits_processor = [PresencePenaltyLogitsProcessor(sampling.get("presence_penalty", 1.5))]
+    logits_processor = [PresencePenaltyLogitsProcessor(
+        presence_penalty=sampling.get("presence_penalty", 1.5),
+    )]
 
     use_ttt = model_ctx is not None and model_ctx.get("ttt_enabled", False)
     if use_ttt:
@@ -380,6 +457,8 @@ def evaluate_problem(model, tokenizer, cfg, problem_info, model_ctx=None):
     else:
         past_key_values = None
 
+    streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
+    stopping_criteria = [LoopDetectionStoppingCriteria()]
     with torch.no_grad():
         output_ids = model.generate(
             input_ids,
@@ -390,6 +469,8 @@ def evaluate_problem(model, tokenizer, cfg, problem_info, model_ctx=None):
             top_k=sampling.get("top_k", 20),
             repetition_penalty=sampling.get("repetition_penalty", 1.0),
             logits_processor=logits_processor,
+            stopping_criteria=stopping_criteria,
+            streamer=streamer,
         )
 
     elapsed = time.time() - t0
@@ -495,6 +576,36 @@ def main():
         think = "YES" if r["has_think_close"] else "NO"
         ext = r["extracted"] if r["extracted"] else "(none)"
         print(f"  {i + 1:>3}  {r['expected']:>10}  {ext:>10}  {status:>8}  {think:>8}  {r['new_tokens']:>7}  {r['elapsed']:>5.1f}s")
+
+    # 保存完整结果到 JSON
+    output_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+    # 用配置文件名作为标识，避免 TTT-OFF 和 Original+SWA 冲突
+    config_stem = os.path.splitext(os.path.basename(args.config))[0]
+    json_path = os.path.join(output_dir, f"hmmt_feb2025_{config_stem}_results.json")
+    save_data = {
+        "config": args.config,
+        "config_stem": config_stem,
+        "total": total,
+        "correct": correct_count,
+        "accuracy": correct_count / total,
+        "think_close_count": think_close_count,
+        "problems": [],
+    }
+    for i, r in enumerate(results):
+        save_data["problems"].append({
+            "idx": i + 1,
+            "problem": r["problem"],
+            "expected": r["expected"],
+            "extracted": r["extracted"],
+            "correct": r["correct"],
+            "has_think_close": r["has_think_close"],
+            "new_tokens": r["new_tokens"],
+            "elapsed_s": round(r["elapsed"], 1),
+            "full_output": r["full_output"],
+        })
+    with open(json_path, "w") as f:
+        json.dump(save_data, f, indent=2, ensure_ascii=False)
+    print(f"\n  Results saved to: {json_path}")
 
 
 if __name__ == "__main__":

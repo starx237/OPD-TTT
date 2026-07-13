@@ -2,8 +2,8 @@ from opencompass.models import HuggingFaceBaseModel
 from opencompass.utils.text_postprocessors import extract_non_reasoning_content
 
 _model_configs = [
-    ("qwen35_2b_ttt_on", "data/output/qwen35_2b_ttt/hf_step2000_ttt_on"),
-    ("qwen35_2b_ttt_off", "data/output/qwen35_2b_ttt/hf_step2000_ttt_off"),
+    ("qwen35_2b_ttt_on", "data/output/qwen35_2b_ttt/hf_step5000_ttt_on"),
+    ("qwen35_2b_ttt_off", "data/output/qwen35_2b_ttt/hf_step5000_ttt_off"),
 ]
 
 models = [

@@ -17,6 +17,12 @@ import os
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
+# Qwen3.5 GatedDeltaNet 使用 fla 的 FusedRMSNormGated，其初始化硬编码
+# device=torch.cuda.current_device()，导致模型在 GPU 上初始化参数时 OOM。
+# 设为 None 强制回退到纯 PyTorch 的 Qwen3_5RMSNormGated。
+import transformers.models.qwen3_5.modeling_qwen3_5 as _qwen35_mod
+_qwen35_mod.FusedRMSNormGated = None
+
 import opencompass_compat  # noqa: F401
 
 from opencompass.cli.main import main
