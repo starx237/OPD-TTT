@@ -10,7 +10,7 @@
 model:
   # CPT 完成后的 HF 权重（待 CPT 训练到 step 5000 后使用）
   # 如 CPT 提前停止，改用实际最终 step 的 step{N}_hf 目录
-  model_path: data/output/qwen35_2b_ttt/step5000_hf
+  model_path: data/output/qwen35_2b_ttt/hf_step5000
   # step{N}_hf 只含 model.safetensors，config 从原始模型目录加载
   config_path: model_assets/qwen3.5-2b
   tokenizer_path: model_assets/qwen3.5-2b

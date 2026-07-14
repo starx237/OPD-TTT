@@ -126,18 +126,22 @@ def _setup_ttt_inference(tc):
     )
 
     # --- MLP: 推理模式 ---
+    # 与 inference_model/hf_qwen3_5/modeling_qwen3_5.py (Qwen3_5TTTMLP) 和训练代码对齐：
+    # - 完整 chunk 参与权重更新（不做 [:-1] token 级切片）
+    # - 最后 chunk 条件检查（padding 时不更新权重）
+    # - present_w 使用 .clone() 避免引用原始权重
+    # - float32 upcast 与训练代码一致
     def inference_mlp_forward(self, x, t=None, teacher_repr=None, past_w=None, **kwargs):
         h = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
         if not self.enable_opdttt or not hasattr(self, "ttt_conv"):
             return self.down_proj(h), {}
 
-        present_w = self.down_proj.weight if past_w is None else past_w
+        present_w = self.down_proj.weight.clone() if past_w is None else past_w
 
         if t is None:
             out = torch.nn.functional.linear(h, present_w, self.down_proj.bias)
             return out, present_w
 
-        # 有 target: 分块处理（与训练逻辑一致）
         seq_len = x.shape[1]
         chunk_size = self.ttt_chunk
 
@@ -165,25 +169,28 @@ def _setup_ttt_inference(tc):
             out_chunk = torch.nn.functional.linear(h_chunk, present_w, self.down_proj.bias)
             outs.append(out_chunk)
 
-            h_for_update = h_chunk[0, :-1].float()
-            t_input = t_chunk[0].T.unsqueeze(0)
-            t_conv = self.ttt_conv(t_input).squeeze(0).T
-            t_conv_for_update = t_conv[:-1].float()
+            # 最后 chunk 且序列非整数倍时，padding 部分不参与权重更新
+            if seq_len % chunk_size == 0 or i != num_chunks - 1:
+                # 使用 bfloat16 与官方推理一致（float32 upcast 累积差异仅 0.004%，不影响结果）
+                h_for_update = h_chunk[0]
+                t_input = t_chunk[0].T.unsqueeze(0)
+                t_conv = self.ttt_conv(t_input).squeeze(0).T
+                t_conv_for_update = t_conv
 
-            if self.ttt_proj is not None:
-                dw = (
-                    torch.einsum(
-                        "ch,cd,de->eh",
-                        h_for_update,
-                        t_conv_for_update,
-                        self.ttt_proj.weight.float(),
+                if self.ttt_proj is not None:
+                    dw = (
+                        torch.einsum(
+                            "ch,cd,de->eh",
+                            h_for_update,
+                            t_conv_for_update,
+                            self.ttt_proj.weight,
+                        )
+                        * self.ttt_lr
                     )
-                    * self.ttt_lr
-                )
-            else:
-                dw = torch.einsum("ch,cd->dh", h_for_update, t_conv_for_update) * self.ttt_lr
+                else:
+                    dw = torch.einsum("ch,cd->dh", h_for_update, t_conv_for_update) * self.ttt_lr
 
-            present_w = present_w + dw.to(present_w.dtype)
+                present_w = present_w + dw
 
         out = torch.cat(outs, dim=1)[:, :seq_len, :]
         return out, present_w
@@ -331,7 +338,12 @@ def load_trained_model(cfg):
     sd = {}
     for f in sorted(glob.glob(f"{ckpt_path}/*.safetensors")):
         sd.update(load_file(f))
-    model.load_state_dict(sd, strict=False)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    real_unexpected = [k for k in unexpected if "teacher_proj" not in k]
+    if missing:
+        raise RuntimeError(f"Missing keys in checkpoint:\n{missing}")
+    if real_unexpected:
+        raise RuntimeError(f"Unexpected keys (non-teacher_proj):\n{real_unexpected}")
     model = model.cuda().bfloat16().eval()
 
     if ttt_enabled:

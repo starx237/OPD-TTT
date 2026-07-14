@@ -69,7 +69,15 @@ def _patched_load_model(self, path, kwargs, peft_path=None, peft_kwargs=dict()):
         with safe_open(sf, framework="pt") as f:
             for k in f.keys():
                 sd[k] = f.get_tensor(k)
-    model.load_state_dict(sd, strict=False)
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # teacher_proj.* 是训练模型有但推理模型不需要的参数，允许 unexpected
+    real_unexpected = [k for k in unexpected if "teacher_proj" not in k]
+    if missing:
+        raise RuntimeError(f"Missing keys in checkpoint (model expects but checkpoint lacks):\n{missing}")
+    if real_unexpected:
+        raise RuntimeError(f"Unexpected keys in checkpoint (non-teacher_proj):\n{real_unexpected}")
+    if unexpected:
+        self.logger.info(f"Ignoring expected unexpected keys (teacher_proj): {[k for k in unexpected if 'teacher_proj' in k]}")
     model = model.to("cuda:0", dtype=dtype)
     model.eval()
     model.generation_config.do_sample = False

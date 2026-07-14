@@ -1321,6 +1321,15 @@ class OPDTTTTrainer:
                         first_line = f.readline()
                     data = _json.loads(first_line)
                     text = data.get("content_split", data.get("content", ""))
+                    if not text:
+                        # conversation 格式（messages）或其他无 content 字段的格式：
+                        # 拼接所有 message 的 content 作为评估文本
+                        messages = data.get("messages", [])
+                        if messages:
+                            text = "\n\n".join(m.get("content", "") for m in messages)
+                        if not text:
+                            logger.info_rank0("跳过 PPL 评估：数据格式不支持（无 content/content_split/messages 字段）")
+                            return
                     text = text * ((max_eval_len * 4 // len(text)) + 1)
                     samples.append(self.tokenizer(text, return_tensors="pt")["input_ids"][:, :max_eval_len])
                 eval_ids = torch.cat(samples, dim=0)
@@ -1462,9 +1471,14 @@ class OPDTTTTrainer:
                         continue
                     text = data.get("content_split", data.get("content", ""))
                     if not text:
+                        # conversation 格式：拼接所有 message 的 content
+                        messages = data.get("messages", [])
+                        if messages:
+                            text = "\n\n".join(m.get("content", "") for m in messages)
+                    if not text:
                         continue
-                    # 粗筛：字符长度至少 min_len*2（保守 token/char 比），减少 tokenize 调用
-                    if len(text) < min_len * 2:
+                    # 粗筛：字符长度至少 min_len*4（~4 chars/token），减少 tokenize 调用
+                    if len(text) < min_len * 4:
                         continue
                     ids = self.tokenizer(text, return_tensors="pt")["input_ids"]
                     if ids.shape[1] >= min_len:

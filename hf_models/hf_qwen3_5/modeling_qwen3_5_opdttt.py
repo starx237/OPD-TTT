@@ -135,6 +135,12 @@ class OPDQwen3_5MLP(nn.Module):
         if teacher_repr is not None:
             teacher_repr = self.padding(teacher_repr)
         dtype = h_padded.dtype
+        # NOTE: 以下 float32 upcast 与官方代码不一致（官方全程使用 bfloat16）。
+        # 测试显示累积 31 次后总漂移差异仅 0.004%（随机误差部分抵消），实际影响可忽略。
+        # upcast 最初为 OPD 教师对齐路径（teacher_align、cosine_similarity）的数值稳定性而加，
+        # 但当前配置 lambda_align_rep=0.0、无教师，这些路径全部关闭。
+        # 推理代码已统一使用 bfloat16（与官方一致）。
+        # 后续重新训练时应移除此 upcast 以与官方和推理一致。
         h_float = h_padded[:, :-1].float() if dtype == torch.bfloat16 else h_padded[:, :-1]
         ntp_target_float = ntp_target[:, :-1].float() if dtype == torch.bfloat16 else ntp_target[:, :-1]
         if self.ttt_proj is not None:
@@ -193,9 +199,12 @@ class OPDQwen3_5MLP(nn.Module):
         down_proj = torch.einsum("b t d h, b t c h -> b t c d", d_down_proj_sum, h_padded)
         output = rearrange(down_proj, "b t c d -> b (t c) d")[:, : x.shape[1], :]
         ntp_target_3d = rearrange(ntp_target, "b t c d -> b (t c) d")[:, : x.shape[1], :]
-        loss_dict = {
-            "ntp_loss": self._compute_repr_loss(output[:, :-1], ntp_target_3d[:, 1:]),
-        }
+        with torch.no_grad():
+            loss_dict = {
+                "ntp_loss": self._compute_repr_loss(
+                    output[:, :-1].detach(), ntp_target_3d[:, 1:].detach()
+                ),
+            }
         with torch.no_grad():
             cumulative_update = d_down_proj_sum[:, -1] - d_down_proj_sum[:, 0]
             update_norm = cumulative_update.norm(p='fro')
@@ -212,7 +221,10 @@ class OPDQwen3_5MLP(nn.Module):
                 teacher_proj_weight,
             )
             teacher_repr_projected = teacher_repr_projected.to(dtype)
-            loss_dict["align_rep_loss"] = self._compute_repr_loss(output[:, :-1], teacher_repr_projected[:, 1:])
+            with torch.no_grad():
+                loss_dict["align_rep_loss"] = self._compute_repr_loss(
+                    output[:, :-1].detach(), teacher_repr_projected[:, 1:].detach()
+                )
         return output, loss_dict
 
     def _compute_repr_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

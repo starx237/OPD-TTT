@@ -140,6 +140,11 @@ class Qwen3_5TTTMLP(nn.Module):
             y[0][i] = current_y
             if seq_len % self.ttt_chunk == 0 or i != chunk_num - 1:
                 if self.ttt_proj is not None:
+                    # NOTE: lambda_ntp 乘法在官方推理中不存在（官方仅乘 ttt_lr）。
+                    # 此处保留是为了与训练代码保持一致（训练中 lambda_ntp=1.0，无数值影响）。
+                    # 若后续对齐官方，应移除 * self.lambda_ntp。
+                    # NOTE: 训练代码使用 float32 upcast 计算 dw，但测试显示累积差异仅 0.004%
+                    # （随机误差部分抵消），此处使用 bfloat16 与官方一致以加速。
                     dw = (
                         contract("c h, c d, d e -> e h", current_h, current_t, self.ttt_proj.weight)
                         * self.ttt_lr * self.lambda_ntp

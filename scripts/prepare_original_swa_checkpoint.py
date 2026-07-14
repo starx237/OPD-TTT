@@ -90,6 +90,12 @@ def main():
         for k in f.keys():
             sd_check[k] = f.get_tensor(k)
     missing, unexpected = model.load_state_dict(sd_check, strict=False)
+    # lm_head.weight 是 tied weights（与 embed_tokens 共享），checkpoint 中不单独存储
+    real_missing = [k for k in missing if k != "lm_head.weight"]
+    if real_missing:
+        print(f"  WARNING: Unexpected missing keys: {real_missing}")
+    if unexpected:
+        print(f"  WARNING: Unexpected keys in checkpoint: {unexpected}")
     print(f"  Missing: {len(missing)} (lm_head.weight tied to embed_tokens)")
     print(f"  Unexpected: {len(unexpected)}")
     print(f"\nDone! Eval checkpoint at {DST_DIR}")
